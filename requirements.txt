@@ -1,0 +1,7 @@
+python-dotenv
+mistralai
+streamlit
+requests
+langgraph
+pydantic
+supabase
