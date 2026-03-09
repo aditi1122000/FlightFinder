@@ -17,6 +17,13 @@ import uuid
 
 import streamlit as st
 
+try:
+    for key, value in st.secrets.items():
+        if isinstance(value, str) and key not in os.environ:
+            os.environ[key] = value
+except Exception:
+    pass
+
 from src.config import DEFAULT_SLOTS, MODEL_NAME, MAX_HISTORY, MAX_TOKENS_LLM, SYSTEM_PROMPT
 from src.services.flight_services import (
     call_mistral_with_backoff,
