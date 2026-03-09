@@ -2,6 +2,8 @@
 Shared flight-finder logic: LLM calls, parsing, validation, search, formatting.
 No Streamlit imports — safe to use from graph nodes and CLI.
 """
+import csv
+import io
 import os
 import time
 import random
@@ -24,11 +26,24 @@ from src.config import (
     BASE_DELAY,
     PROTECTIVE_SLEEP,
     ERROR_MESSAGES,
+    MISSING_SLOT_LABELS,
 )
 
 logger = logging.getLogger(__name__)
 
 _client = None
+
+
+def format_missing_slots(missing_keys: List[str], details: Optional[Dict] = None) -> str:
+    """Build a user-facing line listing what's missing (e.g. 'Still needed: • A specific departure date...')."""
+    if not missing_keys:
+        return ""
+    details = details or {}
+    bullets = []
+    for key in missing_keys:
+        label = details.get(key) or MISSING_SLOT_LABELS.get(key, key.replace("_", " ").title())
+        bullets.append(f"• {label}")
+    return "**Still needed:**\n" + "\n".join(bullets)
 
 
 def _to_str(x):
@@ -137,6 +152,35 @@ def extract_json_from_response(text: str) -> Optional[Dict]:
             return json.loads(cleaned)
         except json.JSONDecodeError:
             pass
+    # Fallback for truncated response: no </json_data>, take from <json_data> to last }
+    open_tag = re.search(r'<json_data>\s*', text, re.IGNORECASE)
+    if open_tag:
+        tail = text[open_tag.end():]
+        first_brace = tail.find("{")
+        last_brace = tail.rfind("}")
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            raw = tail[first_brace : last_brace + 1]
+            cleaned = clean_json_text(raw)
+            try:
+                return json.loads(cleaned)
+            except json.JSONDecodeError:
+                pass
+    return None
+
+
+def extract_misc_from_response(text: str) -> Optional[str]:
+    """Extract optional <misc>...</misc> content for special requests (table, summary, etc.). Output as-is."""
+    if not (text or isinstance(text, str)):
+        return None
+    misc_match = re.search(r'<misc>\s*(.*?)</misc>', text, re.DOTALL | re.IGNORECASE)
+    if misc_match:
+        out = misc_match.group(1).strip()
+        return out if out else None
+    # Truncated response: no </misc>, take from <misc> to end
+    open_tag = re.search(r'<misc>\s*', text, re.IGNORECASE)
+    if open_tag:
+        out = text[open_tag.end():].strip()
+        return out if out else None
     return None
 
 
@@ -153,6 +197,8 @@ def extract_conversational_message(text: str) -> str:
         text = re.sub(r'<conversational_message>', '', text, flags=re.IGNORECASE)
         text = re.sub(r'</conversational_message>', '', text, flags=re.IGNORECASE)
     text = re.sub(r'<json_data>.*?</json_data>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<misc>.*?</misc>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<misc>.*', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'<[^>]+>', '', text)
     text = re.sub(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', '', text, flags=re.DOTALL)
     text = re.sub(r'\{.*?\}', '', text, flags=re.DOTALL)
@@ -249,7 +295,15 @@ def validate_slots(slots: Dict) -> Tuple[bool, Optional[str], Optional[Dict]]:
         errors.append("passengers")
         error_details["passengers"] = "At least 1 adult passenger is required"
     if errors:
+        logger.warning(
+            "validate_slots: invalid slots=%s details=%s",
+            errors,
+            error_details,
+        )
         return False, ERROR_MESSAGES["missing_info"], error_details
+    _oc = _to_str(origin.get("airport_code")) or _to_str(origin.get("city"))
+    _dc = _to_str(destination.get("airport_code")) or _to_str(destination.get("city"))
+    logger.debug("validate_slots: ok origin=%s dest=%s date=%s", _oc or "(empty)", _dc or "(empty)", departure_date)
     return True, None, None
 
 
@@ -319,6 +373,42 @@ def format_price_range(stats: Optional[Dict]) -> str:
     if not stats or (stats.get("max_price") or 0) == 0:
         return "Price on request"
     return f"₹{stats['min_price']:,.0f} - ₹{stats['max_price']:,.0f} (Avg: ₹{stats['avg_price']:,.0f})"
+
+
+def flights_to_csv(flights: List[Dict]) -> str:
+    """Build a CSV string from flight list for download. Uses full data from last_search_results (no truncation)."""
+    if not flights:
+        return ""
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow([
+        "#", "Airline", "Flight No.", "Date", "Price (₹)", "Route", "Departure", "Arrival", "Stops", "Booking Link",
+    ])
+    for i, f in enumerate(flights, 1):
+        f = f if isinstance(f, dict) else {}
+        price = f.get("price")
+        try:
+            price_str = f"{float(price):,.0f}" if price is not None else ""
+        except (TypeError, ValueError):
+            price_str = ""
+        route = ""
+        if f.get("origin_code") and f.get("destination_code"):
+            route = f"{f['origin_code']} → {f['destination_code']}"
+        stops = "Non-stop" if f.get("non_stop") else "With stops"
+        date_display = format_departure_date_display(f.get("departure_date"))
+        writer.writerow([
+            i,
+            (f.get("airline") or "").replace("\n", " "),
+            (f.get("flight_number") or "").replace("\n", " "),
+            date_display,
+            price_str,
+            route,
+            (f.get("departure_time") or "").replace("\n", " "),
+            (f.get("arrival_time") or "").replace("\n", " "),
+            stops,
+            f.get("source_url") or "",
+        ])
+    return out.getvalue()
 
 
 def calculate_price_stats(flights: List[Dict]) -> Optional[Dict]:
@@ -522,7 +612,19 @@ def _search_flights_single_route(
     for f in flights:
         f["origin_code"] = origin_code
         f["destination_code"] = dest_code
+        f["departure_date"] = departure_date
     return flights, None, None
+
+
+def format_departure_date_display(date_str: Optional[str]) -> str:
+    """Format YYYY-MM-DD as '12 Nov 2026' for display next to flight number."""
+    if not date_str or not isinstance(date_str, str):
+        return ""
+    try:
+        dt = datetime.strptime(date_str.strip()[:10], "%Y-%m-%d")
+        return dt.strftime("%d %b %Y")
+    except ValueError:
+        return date_str[:10] if len(date_str) >= 10 else date_str
 
 
 def search_flights_api(slots: Dict, max_results: int = 10) -> Tuple[List[Dict], Optional[str], Optional[Dict]]:
@@ -535,6 +637,12 @@ def search_flights_api(slots: Dict, max_results: int = 10) -> Tuple[List[Dict], 
         destination = {}
     origin_codes = _slot_codes_list(origin)
     dest_codes = _slot_codes_list(destination)
+    logger.info(
+        "search_flights_api: slots origin=%s dest=%s date=%s",
+        origin.get("airport_code") or origin.get("city"),
+        destination.get("airport_code") or destination.get("city"),
+        slots.get("departure_date"),
+    )
     if not origin_codes:
         origin_codes = [(_to_str(origin.get("airport_code")) or _to_str(origin.get("city")) or "???").upper()[:3] or "SRC"]
     if not dest_codes:
@@ -582,12 +690,16 @@ def search_flights_api(slots: Dict, max_results: int = 10) -> Tuple[List[Dict], 
             except Exception:
                 pass
         except requests.exceptions.Timeout:
+            logger.warning("search_flights_api: RapidAPI timeout")
             return [], ERROR_MESSAGES["timeout"], None
         except requests.exceptions.RequestException as e:
+            logger.warning("search_flights_api: RapidAPI request error: %s", e)
             return [], ERROR_MESSAGES["network_error"], {"error": str(e)}
         except Exception:
             logger.exception("search_flights_api: RapidAPI unexpected error")
+            return [], ERROR_MESSAGES.get("network_error", "Search failed."), None
 
+    logger.info("search_flights_api: using mock (no RAPIDAPI key or fallback)")
     return mock_search_flights(slots, max_results), None, None
 
 
@@ -635,6 +747,7 @@ def mock_search_flights(slots: Dict, max_results: int = 3) -> List[Dict]:
                     "flight_number": f"{code} {1000 + idx}",
                     "origin_code": o,
                     "destination_code": d,
+                    "departure_date": _to_str(slots.get("departure_date")),
                 })
                 idx += 1
         if idx >= max_results:

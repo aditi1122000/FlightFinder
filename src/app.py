@@ -38,6 +38,10 @@ from src.services.flight_services import (
     call_mistral_with_backoff,
     extract_conversational_message,
     extract_json_from_response,
+    extract_misc_from_response,
+    format_departure_date_display,
+    format_missing_slots,
+    flights_to_csv,
     clean_json_text,
     format_booking_details,
     validate_slots,
@@ -96,8 +100,10 @@ except ImportError as e:
 
 def _apply_graph_result(final_state: dict) -> None:
     """Apply LangGraph final_state to session state and persist last message."""
+    chat_len = len(final_state.get("chat_history") or [])
     st.session_state.chat_history = final_state["chat_history"]
     st.session_state.slots = final_state["slots"]
+    logger.info("_apply_graph_result: applied chat_history len=%d status=%s", chat_len, final_state.get("status"))
     if final_state["chat_history"]:
         last_msg = final_state["chat_history"][-1]
         turn_index = st.session_state.get("turn_index", 1)
@@ -125,8 +131,10 @@ def _apply_graph_result(final_state: dict) -> None:
 def handle_user_message_with_graph(user_input: str) -> bool:
     """Process user message via LangGraph (runs in main thread so result is always applied)."""
     if not LANGGRAPH_AVAILABLE or "flight_graph" not in st.session_state:
+        logger.debug("handle_user_message_with_graph: skip graph (available=%s has_graph=%s)", LANGGRAPH_AVAILABLE, "flight_graph" in st.session_state)
         return False
     try:
+        logger.info("handle_user_message_with_graph: invoking graph user_message=%s...", (user_input or "")[:60])
         initial_state = {
             "status": "clarification_needed",
             "user_message": user_input,
@@ -146,10 +154,11 @@ def handle_user_message_with_graph(user_input: str) -> bool:
         msg = random.choice(STATUS_MESSAGES) if STATUS_MESSAGES else "Processing..."
         with st.spinner(msg):
             final_state = st.session_state.flight_graph.invoke(initial_state)
+        logger.info("handle_user_message_with_graph: graph done status=%s", final_state.get("status"))
         _apply_graph_result(final_state)
         return True
     except Exception as e:
-        logger.error("LangGraph error: %s", e, exc_info=True)
+        logger.exception("handle_user_message_with_graph: LangGraph error")
         st.error(f"LangGraph error: {e}")
         return False
 
@@ -181,6 +190,12 @@ User: {user_input}"""
     conversational_msg = extract_conversational_message(raw_reply)
     json_data = extract_json_from_response(raw_reply)
     conversational_msg = re.sub(r"<[^>]+>", "", conversational_msg).strip()
+    misc = extract_misc_from_response(raw_reply)
+    if misc:
+        conversational_msg = (conversational_msg + "\n\n" + misc).strip()
+
+    status = json_data.get("status", "error") if json_data else "error"
+    logger.info("process_manual_fallback: status=%s", status)
 
     if json_data is None:
         try:
@@ -199,10 +214,14 @@ User: {user_input}"""
         is_valid, error_msg, error_details = validate_slots(st.session_state.slots)
         if not is_valid:
             st.session_state.error_context = error_details
-            _append_message(
-                "assistant",
-                f"{conversational_msg}\n\n{error_msg}\n\nMissing or invalid: {', '.join(error_details.keys())}",
+            missing_line = format_missing_slots(
+                list(error_details.keys()) if error_details else [],
+                error_details,
             )
+            combined = f"{conversational_msg}\n\n{error_msg}"
+            if missing_line:
+                combined = combined + "\n\n" + missing_line
+            _append_message("assistant", combined)
         else:
             flights, api_error, api_error_details = search_flights_api(st.session_state.slots, max_results=10)
             st.session_state.last_search_results = flights
@@ -230,6 +249,9 @@ User: {user_input}"""
                 for i, f in enumerate(flights[:10], 1):
                     fn = f.get("flight_number")
                     airline_display = f"{f['airline']} ({fn})" if fn else f["airline"]
+                    date_display = format_departure_date_display(f.get("departure_date") or st.session_state.slots.get("departure_date"))
+                    if date_display:
+                        airline_display = f"{airline_display} — {date_display}"
                     route = ""
                     if f.get("origin_code") and f.get("destination_code"):
                         route = f"   {f['origin_code']} → {f['destination_code']}\n"
@@ -310,6 +332,9 @@ User: {user_input}"""
             for i, f in enumerate(refined[:10], 1):
                 fn = f.get("flight_number")
                 airline_display = f"{f['airline']} ({fn})" if fn else f["airline"]
+                date_display = format_departure_date_display(f.get("departure_date") or st.session_state.slots.get("departure_date"))
+                if date_display:
+                    airline_display = f"{airline_display} — {date_display}"
                 route = f"   {f['origin_code']} → {f['destination_code']}\n" if f.get("origin_code") and f.get("destination_code") else ""
                 combined += f"**{i}. {airline_display}** — {format_flight_price(f.get('price'))}\n"
                 if route:
@@ -350,6 +375,9 @@ User: {user_input}"""
 
     else:
         conversational_msg = re.sub(r"<[^>]+>", "", conversational_msg).strip()
+        missing = (json_data or {}).get("missing_slots") or []
+        if missing:
+            conversational_msg = (conversational_msg.rstrip() + "\n\n" + format_missing_slots(missing)).strip()
         _append_message("assistant", conversational_msg)
 
 
@@ -447,9 +475,23 @@ I'm here to help you search for flights in plain language. Tell me where you wan
         with st.expander("🔧 Raw Data (for debugging)"):
             st.json(st.session_state.slots)
 
-    for msg in st.session_state.chat_history:
+    _results = st.session_state.get("last_search_results") or []
+    _csv_data = flights_to_csv(_results) if _results else ""
+    _chat = st.session_state.chat_history
+    _last_idx = len(_chat) - 1 if _chat else -1
+
+    for i, msg in enumerate(_chat):
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
+            # In the last assistant message, show download button in the same bubble when we have results
+            if i == _last_idx and msg["role"] == "assistant" and _results and _csv_data:
+                st.download_button(
+                    label="📥 Download as CSV",
+                    data=_csv_data,
+                    mime="text/csv",
+                    file_name="garudax_flights.csv",
+                    key="download_flights_csv_in_message",
+                )
 
     user_input = st.chat_input("Type your message here...")
     if not user_input:
@@ -465,6 +507,7 @@ I'm here to help you search for flights in plain language. Tell me where you wan
 
     st.session_state.is_calling_model = True
     _append_message("user", user_input)
+    logger.info("Processing user message (len=%d), trying graph first", len(user_input or ""))
 
     try:
         if handle_user_message_with_graph(user_input):

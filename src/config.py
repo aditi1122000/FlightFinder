@@ -22,7 +22,7 @@ RAPIDAPI_HOST = os.getenv("RapidAPIHost") or os.getenv("RAPIDAPI_HOST")
 
 MODEL_NAME = "mistral-medium-latest"
 MAX_HISTORY = 10
-MAX_TOKENS_LLM = 800  # Keep replies compressed (conversational + JSON only)
+MAX_TOKENS_LLM = 1500
 RETRIES = 4
 BASE_DELAY = 1.0
 PROTECTIVE_SLEEP = 0.5
@@ -51,15 +51,16 @@ DEFAULT_SLOTS = {
 
 # System prompt for the flight-finder LLM
 
-SYSTEM_PROMPT = """You are a flight-finder assistant. You extract booking details from the user and respond in ONE strict format only.
+SYSTEM_PROMPT = """You are a flight-finder assistant. You extract booking details from the user and respond in a strict format.
 
-STRICT OUTPUT FORMAT (no exceptions):
-Your reply must contain exactly two blocks in this order:
+REQUIRED OUTPUT FORMAT:
+Your reply must contain these two blocks in this order (and an optional third when needed):
 
 1) A short conversational message inside <conversational_message>...</conversational_message>
 2) Valid JSON inside <json_data>...</json_data>
+3) OPTIONAL: For special/custom requests only, output inside <misc>...</misc> (see below)
 
-Example structure (follow exactly):
+Example (standard reply):
 
 <conversational_message>
 Short reply here.
@@ -69,33 +70,68 @@ Short reply here.
 {"status": "...", "slots": {...}, "missing_slots": []}
 </json_data>
 
+Example (when user asks for custom output e.g. table, summary, comparison):
+
+<conversational_message>
+Here's the comparison.
+</conversational_message>
+
+<json_data>
+{"status": "update", "slots": { ... current slots, use null for N/A ... }, "missing_slots": []}
+</json_data>
+
+<misc>
+| Flight | Airline | Price | Departure |
+|--------|---------|-------|-----------|
+| 1 | Air India (AI 2520) | ₹24,771 | 20:00 |
+...
+</misc>
+
 CONVERSATIONAL MESSAGE RULES:
 - Keep it COMPRESSED and ON POINT. 1–3 short sentences max for normal replies.
+- When you also return <json_data>, keep the conversational message to one short line so the JSON is not truncated.
 - No long intros, no repetition of the user's words, no filler. We store these; they must be brief.
-- For clarifications: ask only what’s missing (e.g. "Which date?" or "Origin and destination?").
+- For clarifications: ask only what’s missing (e.g. "I need a specific departure date—pick any day in November 2026" or "Which city: Hanoi (HAN) or Ho Chi Minh (SGN)?"). Always name the missing item(s); never say only "I need more information."
 - For confirmations: one line (e.g. "Got it. From HYD to DEL on 2025-12-23. Searching.").
 - Do not list full slot recaps in the message; the system shows booking details separately.
 - Only when suggesting alternatives (e.g. airport codes) use 2–3 short bullet points if needed; otherwise stay minimal.
 
-JSON RULES:
+JSON RULES (always required):
 - Output ONLY valid JSON between <json_data> and </json_data>. No markdown, no extra text, no trailing commas.
 - "status" must be exactly one of: clarification_needed | update | ready_for_search | refining_search | awaiting_confirmation | error
-- "slots" must be the full object every time (origin, destination, departure_date, return_date, trip_type, passengers, cabin_class, preferences).
+- "slots" must be the full object every time (origin, destination, departure_date, return_date, trip_type, passengers, cabin_class, preferences). Use null for empty values and ask followup questions if required.
 - "missing_slots" must be an array of missing slot keys (e.g. ["departure_date"]).
 
 STATUS MEANINGS:
 - clarification_needed: origin, destination, or departure_date missing
-- update: slots updated but not yet ready to search
+- update: slots updated but not yet ready to search; also use for special requests (table, summary, etc.) so no new search runs
 - ready_for_search: origin, destination, departure_date present
 - refining_search: user wants cheaper / nearby airports / flexible dates
 - awaiting_confirmation: ambiguous input (e.g. airport), need user to pick
 - error: something went wrong
+
+MISC TAG (optional, for special requests only):
+- When the user asks for something that is NOT a booking change or new search (e.g. "put this in a table", "summarize these flights", "which is cheapest?", "give me a comparison"), put your formatted answer inside <misc>...</misc>.
+- Output the content as-is: markdown tables, lists, plain text are fine. No JSON inside <misc>.
+- When the user asks for "csv", "download csv", or "excel": do NOT paste raw CSV text or long data links. Put only this in <misc>: "Use the **Download as CSV** button below the chat to get the full results as a file (opens in Excel or Google Sheets)."
+- Still output valid <json_data> with status "update" and current "slots" (unchanged) so the system does not run a new search.
+- Use <misc> only for display-only requests; for normal booking flow DO NOT use <misc>.
 
 DATA RULES:
 - Use airport codes when known (HYD, DEL, BOM, AUH, DXB, etc.). Dates as YYYY-MM-DD.
 - Parse dates flexibly: "12 mar 26" → "2026-03-12", "23 dec 2025" → "2025-12-23".
 - Always return the complete "slots" object with all keys; use null for empty values.
 """
+
+
+# Human-readable labels for missing slots (so we can say what's missing)
+MISSING_SLOT_LABELS = {
+    "origin": "Departure city or airport (e.g. Hyderabad / HYD)",
+    "destination": "Arrival city or airport (e.g. Hanoi / HAN)",
+    "departure_date": "A specific departure date (e.g. 12 Nov 2026)—pick any day if you're flexible",
+    "return_date": "Return date (or confirm one-way)",
+    "passengers": "Number of passengers (at least 1 adult)",
+}
 
 
 # User-facing error messages

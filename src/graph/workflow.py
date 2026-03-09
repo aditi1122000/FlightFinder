@@ -16,6 +16,9 @@ from src.services.flight_services import (
     call_mistral_with_backoff,
     extract_conversational_message,
     extract_json_from_response,
+    extract_misc_from_response,
+    format_departure_date_display,
+    format_missing_slots,
     validate_slots,
     search_flights_api,
     calculate_price_stats,
@@ -80,6 +83,9 @@ User: {state["user_message"]}"""
     conversational_msg = extract_conversational_message(raw_reply)
     json_data = extract_json_from_response(raw_reply)
     conversational_msg = re.sub(r'<[^>]+>', '', conversational_msg).strip()
+    misc = extract_misc_from_response(raw_reply)
+    if misc:
+        conversational_msg = (conversational_msg + "\n\n" + misc).strip()
 
     state["conversational_message"] = conversational_msg
 
@@ -93,7 +99,11 @@ User: {state["user_message"]}"""
     else:
         state["status"] = "error"
         state["error_message"] = "Failed to parse LLM response"
-        logger.warning("parse_llm: no JSON, status=error. Snippet: %s...", (raw_reply or "")[:500].replace("\n", " "))
+        logger.warning(
+            "parse_llm: no JSON, status=error. Snippet: %s...",
+            (raw_reply or "")[:500].replace("\n", " "),
+        )
+        logger.info("parse_llm: appending format_error to chat_history")
         # Strict format: only accept valid JSON; show short error, do not use unparsed text
         state["chat_history"].append({
             "role": "assistant",
@@ -104,9 +114,13 @@ User: {state["user_message"]}"""
 
 
 def handle_clarification(state: FlightState) -> FlightState:
-    """Handle clarification_needed: add assistant message to chat."""
-    msg = state["conversational_message"]
+    """Handle clarification_needed: add assistant message to chat; append what's missing if known."""
+    msg = state["conversational_message"] or ""
+    missing = state.get("missing_slots") or []
+    if missing:
+        msg = (msg.rstrip() + "\n\n" + format_missing_slots(missing)).strip()
     state["chat_history"].append({"role": "assistant", "content": msg})
+    logger.info("handle_clarification: appended message (len=%d) missing_slots=%s", len(msg), missing)
     return state
 
 
@@ -114,22 +128,42 @@ def handle_update(state: FlightState) -> FlightState:
     """Handle update: add assistant message to chat."""
     msg = state["conversational_message"]
     state["chat_history"].append({"role": "assistant", "content": msg})
+    logger.info("handle_update: appended message (len=%d)", len(msg or ""))
     return state
 
 
 def handle_ready_for_search(state: FlightState) -> FlightState:
     """Handle ready_for_search: validate slots, call search API, format and append results."""
+    logger.info("handle_ready_for_search: entered")
     slots_dict = state["slots"]
     is_valid, error_msg, error_details = validate_slots(slots_dict)
 
     if not is_valid:
+        logger.warning(
+            "handle_ready_for_search: slot validation failed errors=%s details=%s",
+            list(error_details.keys()) if error_details else [],
+            error_details,
+        )
         state["status"] = "awaiting_confirmation"
         state["error_context"] = error_details
         state["error_message"] = error_msg
-        state["conversational_message"] += f"\n\n{error_msg}"
+        base_msg = (state.get("conversational_message") or "") + f"\n\n{error_msg}"
+        missing_line = format_missing_slots(
+            list(error_details.keys()) if error_details else [],
+            error_details,
+        )
+        if missing_line:
+            base_msg = base_msg + "\n\n" + missing_line
+        state["conversational_message"] = base_msg
+        state["chat_history"].append({"role": "assistant", "content": state["conversational_message"]})
         return state
 
     flights, api_error, api_error_details = search_flights_api(slots_dict, max_results=10)
+    logger.info(
+        "handle_ready_for_search: search returned flights=%d api_error=%s",
+        len(flights) if flights else 0,
+        bool(api_error),
+    )
     state["last_search_results"] = [f if isinstance(f, dict) else getattr(f, "dict", lambda: f)() for f in flights]
     state["last_search_params"] = slots_dict.copy()
 
@@ -166,6 +200,9 @@ def handle_ready_for_search(state: FlightState) -> FlightState:
                 f_dict = {"airline": "?", "departure_time": "?", "arrival_time": "?", "price": None, "non_stop": True, "source_url": "#", "flight_number": None}
             fn = f_dict.get("flight_number")
             airline_display = f"{f_dict['airline']} ({fn})" if fn else f_dict["airline"]
+            date_display = format_departure_date_display(f_dict.get("departure_date") or slots_dict.get("departure_date"))
+            if date_display:
+                airline_display = f"{airline_display} — {date_display}"
             route = ""
             if f_dict.get("origin_code") and f_dict.get("destination_code"):
                 route = f"   {f_dict['origin_code']} → {f_dict['destination_code']}\n"
@@ -181,6 +218,7 @@ def handle_ready_for_search(state: FlightState) -> FlightState:
 
     state["conversational_message"] = combined_msg
     state["chat_history"].append({"role": "assistant", "content": combined_msg})
+    logger.info("handle_ready_for_search: appended results to chat_history")
     return state
 
 
@@ -262,6 +300,9 @@ def handle_refining_search(state: FlightState) -> FlightState:
         for i, f in enumerate(refined_flights[:10], 1):
             fn = f.get("flight_number")
             airline_display = f"{f['airline']} ({fn})" if fn else f["airline"]
+            date_display = format_departure_date_display(f.get("departure_date") or slots_dict.get("departure_date"))
+            if date_display:
+                airline_display = f"{airline_display} — {date_display}"
             route = f"   {f['origin_code']} → {f['destination_code']}\n" if f.get("origin_code") and f.get("destination_code") else ""
             combined_msg += f"**{i}. {airline_display}** — {format_flight_price(f.get('price'))}\n"
             if route:
@@ -308,23 +349,31 @@ def handle_awaiting_confirmation(state: FlightState) -> FlightState:
 
     state["conversational_message"] = combined_msg
     state["chat_history"].append({"role": "assistant", "content": combined_msg})
+    logger.info("handle_awaiting_confirmation: appended message (len=%d)", len(combined_msg or ""))
     return state
 
 
 def route_status(state: FlightState) -> Literal["clarification", "update", "ready", "refining", "awaiting", "error", "end"]:
     status = state.get("status", "error")
     if status == "clarification_needed":
+        logger.info("route: status=%s -> clarification", status)
         return "clarification"
     if status == "update":
+        logger.info("route: status=%s -> update", status)
         return "update"
     if status == "ready_for_search":
+        logger.info("route: status=%s -> ready", status)
         return "ready"
     if status == "refining_search":
+        logger.info("route: status=%s -> refining", status)
         return "refining"
     if status == "awaiting_confirmation":
+        logger.info("route: status=%s -> awaiting", status)
         return "awaiting"
     if status == "error":
+        logger.warning("route: status=error -> END")
         return "error"
+    logger.info("route: status=%s -> end", status)
     return "end"
 
 
