@@ -5,6 +5,7 @@ Imports from services and state only (no Streamlit) so the graph can run without
 import json
 import logging
 import re
+from datetime import datetime
 from typing import Literal
 
 from langgraph.graph import StateGraph, END
@@ -29,6 +30,12 @@ from src.services.flight_services import (
 logger = logging.getLogger(__name__)
 
 
+def _current_date_context() -> str:
+    """Return current date string for LLM context (so it uses the correct year/date)."""
+    now = datetime.now()
+    return now.strftime("%Y-%m-%d (%A, %B %d, %Y)")
+
+
 def parse_llm_response(state: FlightState) -> FlightState:
     """Entry node: call LLM, parse response, update state with status and slots."""
     user_msg = (state.get("user_message") or "")[:80]
@@ -36,14 +43,22 @@ def parse_llm_response(state: FlightState) -> FlightState:
     conversation_messages = state["chat_history"][-MAX_HISTORY:]
     slots_dict = state["slots"]
     slots_context = json.dumps(slots_dict, indent=2)
-    user_message_with_context = f"""[Current booking state: {slots_context}]
+    today = _current_date_context()
+    user_message_with_context = f"""[Current date: {today}]
+[Current booking state: {slots_context}]
 
 User: {state["user_message"]}"""
 
+    system_content = (
+        SYSTEM_PROMPT
+        + "\n\nToday's date (use this when interpreting relative dates like 'next Friday', 'in March', or 'tomorrow'): "
+        + today
+        + ". Always use this date's year and calendar when resolving relative dates; do not assume 2024."
+    )
     payload = {
         "model": MODEL_NAME,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT}
+            {"role": "system", "content": system_content}
         ] + conversation_messages + [
             {"role": "user", "content": user_message_with_context}
         ],
@@ -151,7 +166,12 @@ def handle_ready_for_search(state: FlightState) -> FlightState:
                 f_dict = {"airline": "?", "departure_time": "?", "arrival_time": "?", "price": None, "non_stop": True, "source_url": "#", "flight_number": None}
             fn = f_dict.get("flight_number")
             airline_display = f"{f_dict['airline']} ({fn})" if fn else f_dict["airline"]
+            route = ""
+            if f_dict.get("origin_code") and f_dict.get("destination_code"):
+                route = f"   {f_dict['origin_code']} → {f_dict['destination_code']}\n"
             combined_msg += f"**{i}. {airline_display}** — {format_flight_price(f_dict.get('price'))}\n"
+            if route:
+                combined_msg += route
             combined_msg += f"   Departure: {f_dict['departure_time']} | Arrival: {f_dict['arrival_time']}\n"
             combined_msg += f"   {'Non-stop' if f_dict.get('non_stop') else 'With stops'}\n"
             if f_dict.get("source_url") and f_dict["source_url"] != "#":
@@ -199,8 +219,10 @@ def handle_refining_search(state: FlightState) -> FlightState:
             refinement_msg = f"Found {len(refined_flights)} flights within your budget"
 
     elif refinement_type == "nearby_airports":
-        origin_code = (slots_dict.get("origin") or {}).get("airport_code")
-        dest_code = (slots_dict.get("destination") or {}).get("airport_code")
+        _oc = (slots_dict.get("origin") or {}).get("airport_code")
+        _dc = (slots_dict.get("destination") or {}).get("airport_code")
+        origin_code = (_oc[0] if isinstance(_oc, list) and _oc else _oc) or ""
+        dest_code = (_dc[0] if isinstance(_dc, list) and _dc else _dc) or ""
         nearby_origin = find_nearby_airports(origin_code) if origin_code else []
         nearby_dest = find_nearby_airports(dest_code) if dest_code else []
         all_flights = []
@@ -240,7 +262,10 @@ def handle_refining_search(state: FlightState) -> FlightState:
         for i, f in enumerate(refined_flights[:10], 1):
             fn = f.get("flight_number")
             airline_display = f"{f['airline']} ({fn})" if fn else f["airline"]
+            route = f"   {f['origin_code']} → {f['destination_code']}\n" if f.get("origin_code") and f.get("destination_code") else ""
             combined_msg += f"**{i}. {airline_display}** — {format_flight_price(f.get('price'))}\n"
+            if route:
+                combined_msg += route
             combined_msg += f"   Departure: {f['departure_time']} | Arrival: {f['arrival_time']}\n"
             combined_msg += f"   {'Non-stop' if f.get('non_stop') else 'With stops'}\n"
             if f.get("source_url") and f["source_url"] != "#":

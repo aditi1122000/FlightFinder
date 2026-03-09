@@ -14,8 +14,6 @@ from typing import Dict, List, Optional, Tuple
 
 from src.config import (
     MISTRAL_API_KEY,
-    FLIGHT_API_KEY,
-    FLIGHT_API_BASE_URL,
     AIRPORT_API_KEY,
     AIRPORT_API_BASE_URL,
     RAPIDAPI_KEY,
@@ -31,6 +29,35 @@ from src.config import (
 logger = logging.getLogger(__name__)
 
 _client = None
+
+
+def _to_str(x):
+    """Normalize slot value to string; LLM may return list (e.g. multiple airport codes)."""
+    if x is None:
+        return ""
+    if isinstance(x, list):
+        x = x[0] if x else ""
+    return str(x).strip()
+
+
+def _slot_codes_list(slot: dict, max_codes: int = 5) -> List[str]:
+    """Return list of airport codes from a slot (origin or destination). Supports single code or list from LLM."""
+    if not slot or not isinstance(slot, dict):
+        return []
+    raw = slot.get("airport_code") or slot.get("city")
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        codes = [str(c).strip().upper()[:3] for c in raw if c]
+    else:
+        codes = [str(raw).strip().upper()[:3]] if str(raw).strip() else []
+    seen = set()
+    out = []
+    for c in codes[:max_codes]:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
 
 
 def _get_client():
@@ -155,12 +182,17 @@ def call_mistral_with_backoff(payload: Dict, retries: int = RETRIES, base_delay:
 
 def format_booking_details(slots: Dict) -> str:
     details = []
-    origin = slots.get("origin", {})
-    if origin.get("city") or origin.get("airport_code"):
-        details.append(f"**From:** {origin.get('city', '')} ({origin.get('airport_code', '')})".strip(" ()"))
-    destination = slots.get("destination", {})
-    if destination.get("city") or destination.get("airport_code"):
-        details.append(f"**To:** {destination.get('city', '')} ({destination.get('airport_code', '')})".strip(" ()"))
+    origin = slots.get("origin") or {}
+    destination = slots.get("destination") or {}
+    if not isinstance(origin, dict):
+        origin = {}
+    if not isinstance(destination, dict):
+        destination = {}
+    oc, dc = _to_str(origin.get("airport_code")) or _to_str(origin.get("city")), _to_str(destination.get("airport_code")) or _to_str(destination.get("city"))
+    if _to_str(origin.get("city")) or oc:
+        details.append(f"**From:** {_to_str(origin.get('city', ''))} ({oc})".strip(" ()"))
+    if _to_str(destination.get("city")) or dc:
+        details.append(f"**To:** {_to_str(destination.get('city', ''))} ({dc})".strip(" ()"))
     if slots.get("departure_date"):
         details.append(f"**Departure:** {slots.get('departure_date')}")
     if slots.get("return_date"):
@@ -187,15 +219,19 @@ def format_booking_details(slots: Dict) -> str:
 def validate_slots(slots: Dict) -> Tuple[bool, Optional[str], Optional[Dict]]:
     errors = []
     error_details = {}
-    origin = slots.get("origin", {})
-    if not origin.get("airport_code") and not origin.get("city"):
+    origin = slots.get("origin") or {}
+    destination = slots.get("destination") or {}
+    if not isinstance(origin, dict):
+        origin = {}
+    if not isinstance(destination, dict):
+        destination = {}
+    if not _to_str(origin.get("airport_code")) and not _to_str(origin.get("city")):
         errors.append("origin")
         error_details["origin"] = "Origin airport or city is required"
-    destination = slots.get("destination", {})
-    if not destination.get("airport_code") and not destination.get("city"):
+    if not _to_str(destination.get("airport_code")) and not _to_str(destination.get("city")):
         errors.append("destination")
         error_details["destination"] = "Destination airport or city is required"
-    departure_date = slots.get("departure_date")
+    departure_date = _to_str(slots.get("departure_date"))
     if not departure_date:
         errors.append("departure_date")
         error_details["departure_date"] = "Departure date is required"
@@ -305,9 +341,15 @@ def suggest_alternatives(slots: Dict, empty_reason: str = "no_flights") -> Dict:
         "flexible_dates": [],
         "suggestion_message": "",
     }
-    origin_code = slots.get("origin", {}).get("airport_code")
-    dest_code = slots.get("destination", {}).get("airport_code")
-    departure_date = slots.get("departure_date")
+    origin = slots.get("origin") or {}
+    destination = slots.get("destination") or {}
+    if not isinstance(origin, dict):
+        origin = {}
+    if not isinstance(destination, dict):
+        destination = {}
+    origin_code = _to_str(origin.get("airport_code")) or _to_str(origin.get("city"))
+    dest_code = _to_str(destination.get("airport_code")) or _to_str(destination.get("city"))
+    departure_date = _to_str(slots.get("departure_date"))
     if origin_code:
         suggestions["nearby_origin_airports"] = find_nearby_airports(origin_code)
     if dest_code:
@@ -440,52 +482,105 @@ def _normalize_booking_flight_offer(offer: dict) -> dict:
         return {"airline": "Unknown", "departure_time": "00:00", "arrival_time": "00:00", "price": 0, "non_stop": True, "source_url": "#", "flight_number": None}
 
 
+def _search_flights_single_route(
+    origin_code: str,
+    dest_code: str,
+    slots: Dict,
+    per_route_max: int,
+) -> Tuple[List[Dict], Optional[str], Optional[Dict]]:
+    """Search flights for one origin–destination pair. Returns (flights with origin_code/destination_code set, error, details)."""
+    departure_date = _to_str(slots.get("departure_date"))
+    url = f"https://{RAPIDAPI_HOST.rstrip('/')}/api/v1/flights/searchFlights"
+    params = {
+        "fromId": f"{origin_code}.AIRPORT",
+        "toId": f"{dest_code}.AIRPORT",
+        "stops": "none",
+        "pageNo": "1",
+        "adults": str((slots.get("passengers") or {}).get("adults", 1)),
+        "children": str((slots.get("passengers") or {}).get("children", 0)),
+        "sort": "BEST",
+        "cabinClass": (slots.get("cabin_class") or "ECONOMY").upper() or "ECONOMY",
+        "currency_code": "INR",
+        "departDate": departure_date or "",
+    }
+    headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": RAPIDAPI_HOST}
+    response = requests.get(url, headers=headers, params=params, timeout=30)
+    data = response.json() if response.ok else {}
+    if response.status_code != 200:
+        if response.status_code in (401, 403):
+            return [], ERROR_MESSAGES["api_error_4xx"], {"message": data.get("message", "Invalid RapidAPI key")}
+        return [], None, None
+    inner = data.get("data") or {}
+    offers = inner.get("flightOffers") or []
+    if offers:
+        flights = [_normalize_booking_flight_offer(o) for o in offers[:per_route_max]]
+    else:
+        raw = data.get("data") or data.get("flights") or data.get("result") or []
+        if isinstance(raw, dict):
+            raw = raw.get("flights") or raw.get("data") or []
+        flights = [_normalize_rapidapi_flight(f if isinstance(f, dict) else {}, i) for i, f in enumerate((raw or [])[:per_route_max])]
+    for f in flights:
+        f["origin_code"] = origin_code
+        f["destination_code"] = dest_code
+    return flights, None, None
+
+
 def search_flights_api(slots: Dict, max_results: int = 10) -> Tuple[List[Dict], Optional[str], Optional[Dict]]:
-    origin_code = (slots.get("origin", {}).get("airport_code") or slots.get("origin", {}).get("city", "") or "").strip().upper()[:3]
-    dest_code = (slots.get("destination", {}).get("airport_code") or slots.get("destination", {}).get("city", "") or "").strip().upper()[:3]
-    departure_date = slots.get("departure_date", "")
+    """Search across all origin–destination airport pairs from slots (e.g. NYC airports × LA airports)."""
+    origin = slots.get("origin") or {}
+    destination = slots.get("destination") or {}
+    if not isinstance(origin, dict):
+        origin = {}
+    if not isinstance(destination, dict):
+        destination = {}
+    origin_codes = _slot_codes_list(origin)
+    dest_codes = _slot_codes_list(destination)
+    if not origin_codes:
+        origin_codes = [(_to_str(origin.get("airport_code")) or _to_str(origin.get("city")) or "???").upper()[:3] or "SRC"]
+    if not dest_codes:
+        dest_codes = [(_to_str(destination.get("airport_code")) or _to_str(destination.get("city")) or "???").upper()[:3] or "DST"]
+    # Cap pairs to avoid too many API calls (e.g. 5×5 = 25)
+    max_pairs = 25
+    origin_codes = origin_codes[:5]
+    dest_codes = dest_codes[:5]
+    per_route_max = max(3, (max_results + len(origin_codes) * len(dest_codes) - 1) // (len(origin_codes) * len(dest_codes)))
 
     if RAPIDAPI_KEY and RAPIDAPI_HOST:
         try:
-            url = f"https://{RAPIDAPI_HOST.rstrip('/')}/api/v1/flights/searchFlights"
-            params = {
-                "fromId": f"{origin_code}.AIRPORT",
-                "toId": f"{dest_code}.AIRPORT",
-                "stops": "none",
-                "pageNo": "1",
-                "adults": str(slots.get("passengers", {}).get("adults", 1)),
-                "children": str(slots.get("passengers", {}).get("children", 0)),
-                "sort": "BEST",
-                "cabinClass": (slots.get("cabin_class") or "ECONOMY").upper() or "ECONOMY",
-                "currency_code": "INR",
-                "departDate": departure_date or "",
-            }
-            headers = {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": RAPIDAPI_HOST}
-            response = requests.get(url, headers=headers, params=params, timeout=30)
-            data = response.json() if response.ok else {}
-            if response.status_code == 200:
-                _base = os.path.dirname(os.path.abspath(__file__))
-                _aviation_path = os.path.join(_base, "aviation_response.json")
-                try:
-                    with open(_aviation_path, "w", encoding="utf-8") as f:
-                        json.dump(data, f, indent=2, ensure_ascii=False)
-                except Exception as e:
-                    logger.warning("search_flights_api: could not write aviation_response.json: %s", e)
-                inner = data.get("data") or {}
-                offers = inner.get("flightOffers") or []
-                if offers:
-                    flights = [_normalize_booking_flight_offer(o) for o in offers[:max_results]]
-                    logger.info("search_flights_api: booking API success count=%d", len(flights))
-                    return flights, None, None
-                raw = data.get("data") or data.get("flights") or data.get("result") or []
-                if isinstance(raw, dict):
-                    raw = raw.get("flights") or raw.get("data") or []
-                flights = [_normalize_rapidapi_flight(f if isinstance(f, dict) else {}, i) for i, f in enumerate((raw or [])[:max_results])]
-                if flights:
-                    logger.info("search_flights_api: RapidAPI success count=%d", len(flights))
-                    return flights, None, None
-            if response.status_code in (401, 403):
-                return [], ERROR_MESSAGES["api_error_4xx"], {"message": data.get("message", "Invalid RapidAPI key")}
+            all_flights = []
+            api_error = None
+            api_error_details = None
+            for o in origin_codes:
+                for d in dest_codes:
+                    if o and d:
+                        flights, err, details = _search_flights_single_route(o, d, slots, per_route_max)
+                        if err:
+                            api_error = api_error or err
+                            api_error_details = api_error_details or details
+                        all_flights.extend(flights)
+            if all_flights:
+                # Dedupe by (airline, departure_time, price, route), sort by price
+                seen = set()
+                unique = []
+                for f in all_flights:
+                    key = (f.get("airline"), f.get("departure_time"), f.get("price"), f.get("origin_code"), f.get("destination_code"))
+                    if key not in seen:
+                        seen.add(key)
+                        unique.append(f)
+                unique.sort(key=lambda x: (x.get("price") or 0, x.get("departure_time") or ""))
+                result = unique[:max_results]
+                logger.info("search_flights_api: multi-airport search %d pairs → %d flights", len(origin_codes) * len(dest_codes), len(result))
+                return result, api_error, api_error_details
+            if api_error:
+                return [], api_error, api_error_details
+            # Write last response for debugging if we have one
+            _base = os.path.dirname(os.path.abspath(__file__))
+            _aviation_path = os.path.join(_base, "aviation_response.json")
+            try:
+                with open(_aviation_path, "w", encoding="utf-8") as f:
+                    json.dump({}, f)
+            except Exception:
+                pass
         except requests.exceptions.Timeout:
             return [], ERROR_MESSAGES["timeout"], None
         except requests.exceptions.RequestException as e:
@@ -497,8 +592,16 @@ def search_flights_api(slots: Dict, max_results: int = 10) -> Tuple[List[Dict], 
 
 
 def mock_search_flights(slots: Dict, max_results: int = 3) -> List[Dict]:
-    origin_code = slots.get("origin", {}).get("airport_code") or slots.get("origin", {}).get("city") or "SRC"
-    dest_code = slots.get("destination", {}).get("airport_code") or slots.get("destination", {}).get("city") or "DST"
+    origin = slots.get("origin") or {}
+    destination = slots.get("destination") or {}
+    if not isinstance(origin, dict):
+        origin = {}
+    if not isinstance(destination, dict):
+        destination = {}
+    origin_codes = _slot_codes_list(origin) or [_to_str(origin.get("airport_code")) or _to_str(origin.get("city")) or "SRC"]
+    dest_codes = _slot_codes_list(destination) or [_to_str(destination.get("airport_code")) or _to_str(destination.get("city")) or "DST"]
+    origin_codes = origin_codes[:5]
+    dest_codes = dest_codes[:5]
     sample_airlines = ["IndiGo", "Vistara", "Akasa Air", "Air India", "SpiceJet"]
     booking_urls = {
         "IndiGo": "https://www.goindigo.in/",
@@ -508,20 +611,33 @@ def mock_search_flights(slots: Dict, max_results: int = 3) -> List[Dict]:
         "SpiceJet": "https://www.spicejet.com/",
     }
     flights = []
+    idx = 0
     base_price = 4000
-    codes = ["6E", "UK", "QP", "AI", "SG"]  # IndiGo, Vistara, Akasa, Air India, SpiceJet
-    for i in range(max_results):
-        airline = sample_airlines[i % len(sample_airlines)]
-        code = codes[i % len(codes)]
-        hour = (6 + i * 3) % 24
-        arr_hour = (hour + 2 + (i % 2)) % 24
-        flights.append({
-            "airline": airline,
-            "departure_time": f"{hour:02d}:00",
-            "arrival_time": f"{arr_hour:02d}:10",
-            "price": base_price + i * 900,
-            "non_stop": True,
-            "source_url": booking_urls.get(airline, "#"),
-            "flight_number": f"{code} {1000 + i}",
-        })
-    return flights
+    codes = ["6E", "UK", "QP", "AI", "SG"]
+    for o in origin_codes:
+        for d in dest_codes:
+            if not o or not d:
+                continue
+            for j in range(max(1, max_results // (len(origin_codes) * len(dest_codes)))):
+                if idx >= max_results:
+                    break
+                airline = sample_airlines[idx % len(sample_airlines)]
+                code = codes[idx % len(codes)]
+                hour = (6 + idx * 3) % 24
+                arr_hour = (hour + 2 + (idx % 2)) % 24
+                flights.append({
+                    "airline": airline,
+                    "departure_time": f"{hour:02d}:00",
+                    "arrival_time": f"{arr_hour:02d}:10",
+                    "price": base_price + idx * 900,
+                    "non_stop": True,
+                    "source_url": booking_urls.get(airline, "#"),
+                    "flight_number": f"{code} {1000 + idx}",
+                    "origin_code": o,
+                    "destination_code": d,
+                })
+                idx += 1
+        if idx >= max_results:
+            break
+    flights.sort(key=lambda x: (x.get("price") or 0, x.get("departure_time") or ""))
+    return flights[:max_results]

@@ -12,10 +12,19 @@ if _ROOT not in sys.path:
 
 import json
 import logging
+import random
 import re
 import uuid
 
 import streamlit as st
+
+# Status messages shown at random while processing
+STATUS_MESSAGES = [
+    "Working on the magic…",
+    "Finding all possible flights across airports…",
+    "Checking the best routes for you…",
+    "Almost there — polishing results…",
+]
 
 try:
     for key, value in st.secrets.items():
@@ -54,8 +63,9 @@ logger = logging.getLogger(__name__)
 
 
 def _append_message(role: str, content: str) -> None:
-    """Append to chat_history and persist to Supabase if configured. Uses turn_index; increments after assistant."""
+    """Append to chat_history and persist to Supabase if configured. Uses turn_index and user_name; increments after assistant."""
     turn_index = st.session_state.get("turn_index", 1)
+    user_name = st.session_state.get("user_name") or None
     st.session_state.chat_history.append({"role": role, "content": content})
     try:
         from src.services.supabase_persistence import persist_message
@@ -65,6 +75,7 @@ def _append_message(role: str, content: str) -> None:
             content,
             st.session_state.slots,
             turn_index=turn_index,
+            user_name=user_name,
         )
     except Exception as e:
         logger.debug("Supabase persist skipped: %s", e)
@@ -83,8 +94,36 @@ except ImportError as e:
     logger.warning("LangGraph not available: %s. Using manual fallback.", e)
 
 
+def _apply_graph_result(final_state: dict) -> None:
+    """Apply LangGraph final_state to session state and persist last message."""
+    st.session_state.chat_history = final_state["chat_history"]
+    st.session_state.slots = final_state["slots"]
+    if final_state["chat_history"]:
+        last_msg = final_state["chat_history"][-1]
+        turn_index = st.session_state.get("turn_index", 1)
+        user_name = st.session_state.get("user_name") or None
+        try:
+            from src.services.supabase_persistence import persist_message
+            persist_message(
+                st.session_state.conversation_id,
+                last_msg["role"],
+                last_msg["content"],
+                final_state["slots"],
+                turn_index=turn_index,
+                user_name=user_name,
+            )
+        except Exception:
+            pass
+        st.session_state.turn_index = turn_index + 1
+    st.session_state.last_search_results = final_state.get("last_search_results")
+    st.session_state.last_search_params = final_state.get("last_search_params")
+    st.session_state.price_stats = final_state.get("price_stats")
+    st.session_state.error_context = final_state.get("error_context")
+    st.session_state.suggested_alternatives = final_state.get("suggested_alternatives")
+
+
 def handle_user_message_with_graph(user_input: str) -> bool:
-    """Process user message via LangGraph. Returns True if successful."""
+    """Process user message via LangGraph (runs in main thread so result is always applied)."""
     if not LANGGRAPH_AVAILABLE or "flight_graph" not in st.session_state:
         return False
     try:
@@ -104,31 +143,10 @@ def handle_user_message_with_graph(user_input: str) -> bool:
             "suggested_alternatives": st.session_state.get("suggested_alternatives"),
             "search_history": st.session_state.get("search_history", []),
         }
-        with st.spinner("Processing..."):
+        msg = random.choice(STATUS_MESSAGES) if STATUS_MESSAGES else "Processing..."
+        with st.spinner(msg):
             final_state = st.session_state.flight_graph.invoke(initial_state)
-        st.session_state.chat_history = final_state["chat_history"]
-        st.session_state.slots = final_state["slots"]
-        # Persist the new assistant reply (last message) to Supabase with current turn_index
-        if final_state["chat_history"]:
-            last_msg = final_state["chat_history"][-1]
-            turn_index = st.session_state.get("turn_index", 1)
-            try:
-                from src.services.supabase_persistence import persist_message
-                persist_message(
-                    st.session_state.conversation_id,
-                    last_msg["role"],
-                    last_msg["content"],
-                    final_state["slots"],
-                    turn_index=turn_index,
-                )
-            except Exception as e:
-                logger.debug("Supabase persist skipped: %s", e)
-            st.session_state.turn_index = turn_index + 1
-        st.session_state.last_search_results = final_state.get("last_search_results")
-        st.session_state.last_search_params = final_state.get("last_search_params")
-        st.session_state.price_stats = final_state.get("price_stats")
-        st.session_state.error_context = final_state.get("error_context")
-        st.session_state.suggested_alternatives = final_state.get("suggested_alternatives")
+        _apply_graph_result(final_state)
         return True
     except Exception as e:
         logger.error("LangGraph error: %s", e, exc_info=True)
@@ -157,7 +175,7 @@ User: {user_input}"""
         "max_tokens": MAX_TOKENS_LLM,
     }
 
-    with st.spinner("Thinking..."):
+    with st.spinner(random.choice(STATUS_MESSAGES) if STATUS_MESSAGES else "Thinking..."):
         response = call_mistral_with_backoff(payload)
     raw_reply = response.choices[0].message.content
     conversational_msg = extract_conversational_message(raw_reply)
@@ -212,7 +230,12 @@ User: {user_input}"""
                 for i, f in enumerate(flights[:10], 1):
                     fn = f.get("flight_number")
                     airline_display = f"{f['airline']} ({fn})" if fn else f["airline"]
+                    route = ""
+                    if f.get("origin_code") and f.get("destination_code"):
+                        route = f"   {f['origin_code']} → {f['destination_code']}\n"
                     combined += f"**{i}. {airline_display}** — {format_flight_price(f.get('price'))}\n"
+                    if route:
+                        combined += route
                     combined += f"   Departure: {f['departure_time']} | Arrival: {f['arrival_time']}\n"
                     combined += f"   {'Non-stop' if f.get('non_stop') else 'With stops'}\n"
                     if f.get("source_url") and f["source_url"] != "#":
@@ -252,8 +275,10 @@ User: {user_input}"""
                 refined.sort(key=lambda x: x.get("price", 0))
                 msg_extra = f"Found {len(refined)} flights within your budget (≤ ₹{threshold:,.0f})"
         elif refinement_type == "nearby_airports":
-            o_code = (st.session_state.slots.get("origin") or {}).get("airport_code")
-            d_code = (st.session_state.slots.get("destination") or {}).get("airport_code")
+            _oc = (st.session_state.slots.get("origin") or {}).get("airport_code")
+            _dc = (st.session_state.slots.get("destination") or {}).get("airport_code")
+            o_code = (_oc[0] if isinstance(_oc, list) and _oc else _oc) or ""
+            d_code = (_dc[0] if isinstance(_dc, list) and _dc else _dc) or ""
             all_f = []
             for airport in (find_nearby_airports(o_code) if o_code else [])[:2] + (find_nearby_airports(d_code) if d_code else [])[:2]:
                 ss = dict(st.session_state.slots)
@@ -285,7 +310,10 @@ User: {user_input}"""
             for i, f in enumerate(refined[:10], 1):
                 fn = f.get("flight_number")
                 airline_display = f"{f['airline']} ({fn})" if fn else f["airline"]
+                route = f"   {f['origin_code']} → {f['destination_code']}\n" if f.get("origin_code") and f.get("destination_code") else ""
                 combined += f"**{i}. {airline_display}** — {format_flight_price(f.get('price'))}\n"
+                if route:
+                    combined += route
                 combined += f"   Departure: {f['departure_time']} | Arrival: {f['arrival_time']}\n"
                 combined += f"   {'Non-stop' if f.get('non_stop') else 'With stops'}\n"
                 if f.get("source_url") and f["source_url"] != "#":
@@ -332,6 +360,8 @@ def main() -> None:
         st.session_state.conversation_id = str(uuid.uuid4())
     if "turn_index" not in st.session_state:
         st.session_state.turn_index = 1
+    if "user_name" not in st.session_state:
+        st.session_state.user_name = ""
     if "slots" not in st.session_state:
         st.session_state.slots = {**DEFAULT_SLOTS}
     if "is_calling_model" not in st.session_state:
@@ -356,6 +386,47 @@ def main() -> None:
             st.warning("Could not initialize LangGraph. Using manual handling.")
 
     st.title("✈️ GarudaX - Your Flight Finder")
+
+    # UI gate: user must enter name before using chat (no agent prompt for name)
+    has_name = bool((st.session_state.user_name or "").strip())
+    if not has_name:
+        st.markdown("Enter your name to continue. Your name is only used to tag your searches.")
+        name_input = st.text_input("Your name", key="user_name_input", placeholder="e.g. Alex", label_visibility="collapsed")
+        if st.button("Continue", key="name_continue"):
+            name = (name_input or "").strip()
+            if name:
+                st.session_state.user_name = name
+                st.rerun()
+            else:
+                st.warning("Please enter your name.")
+        st.caption(f"Conversation ID: `{st.session_state.conversation_id}`")
+        return
+
+    # First-time after name: show intro once (no "what should I call you?")
+    if len(st.session_state.chat_history) == 0:
+        greeting = f"""Hi **{st.session_state.user_name}**! I'm **GarudaX**, your flight-finding assistant. ✈️
+
+I'm here to help you search for flights in plain language. Tell me where you want to go, when, and any preferences—I'll ask a few questions if I need more detail, then show you options.
+
+**I can help with things like:**
+- *"Flights from New York to Los Angeles next Friday"*
+- *"I need to fly to London in March, preferably direct"*
+- *"Cheapest options from JFK to Paris for 2 adults"*
+- *"Weekend trips from Chicago to Miami"*"""
+        st.session_state.chat_history.append({"role": "assistant", "content": greeting})
+        try:
+            from src.services.supabase_persistence import persist_message
+            persist_message(
+                st.session_state.conversation_id,
+                "assistant",
+                greeting,
+                slots=st.session_state.slots,
+                turn_index=st.session_state.get("turn_index", 1),
+                user_name=st.session_state.user_name,
+            )
+        except Exception:
+            pass
+
     st.caption(f"Conversation ID: `{st.session_state.conversation_id}`")
 
     if st.button("🆕 New Chat", key="new_chat"):
@@ -399,7 +470,8 @@ def main() -> None:
         if handle_user_message_with_graph(user_input):
             st.rerun()
         else:
-            process_manual_fallback(user_input)
+            with st.spinner(random.choice(STATUS_MESSAGES) if STATUS_MESSAGES else "Thinking..."):
+                process_manual_fallback(user_input)
             st.rerun()
     except Exception as e:
         logger.exception("Error processing message")

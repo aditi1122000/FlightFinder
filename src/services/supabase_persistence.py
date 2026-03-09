@@ -7,7 +7,7 @@ Optional (low-privilege, respects RLS): SUPABASE_PUBLISHABLE_KEY or SUPABASE_ANO
 """
 import os
 import logging
-from typing import Any, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +53,12 @@ def persist_message(
     content: str,
     slots: Optional[dict] = None,
     turn_index: Optional[int] = None,
+    user_name: Optional[str] = None,
 ) -> bool:
     """
     Insert one message row into Supabase. No-op if Supabase is not configured.
     turn_index pairs user and assistant messages for the same turn (same value for both).
+    user_name tracks which user sent the message (optional).
     Returns True if persisted, False if skipped or failed.
     """
     client = _get_client()
@@ -70,10 +72,12 @@ def persist_message(
         }
         if turn_index is not None:
             row["turn_index"] = turn_index
+        if user_name is not None and (user_name or "").strip():
+            row["user_name"] = (user_name or "").strip()
         if slots is not None:
             row["slots"] = slots
         client.table(TABLE_NAME).insert(row).execute()
-        logger.debug("Persisted message to Supabase: conversation_id=%s role=%s turn_index=%s", conversation_id, role, turn_index)
+        logger.debug("Persisted message to Supabase: conversation_id=%s role=%s turn_index=%s user_name=%s", conversation_id, role, turn_index, user_name)
         return True
     except Exception as e:
         logger.warning("Supabase persist_message failed: %s", e)
