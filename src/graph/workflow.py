@@ -62,7 +62,7 @@ User: {state["user_message"]}"""
         ] + conversation_messages + [
             {"role": "user", "content": user_message_with_context}
         ],
-        "temperature": 0.5,
+        "temperature": 0.2,
         "max_tokens": MAX_TOKENS_LLM,
     }
 
