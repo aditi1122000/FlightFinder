@@ -34,6 +34,29 @@ logger = logging.getLogger(__name__)
 _client = None
 
 
+def fill_slots_from_last_search(slots: Dict, last_params: Optional[Dict]) -> Dict:
+    """When the user doesn't repeat date/route, fill missing slot values from last search (session history)."""
+    if not last_params:
+        return slots
+    out = dict(slots)
+    if not out.get("departure_date") and last_params.get("departure_date"):
+        out["departure_date"] = last_params["departure_date"]
+    if not out.get("return_date") and last_params.get("return_date"):
+        out["return_date"] = last_params["return_date"]
+    for key in ("origin", "destination"):
+        existing = out.get(key) or {}
+        last_val = last_params.get(key)
+        if last_val and isinstance(existing, dict) and isinstance(last_val, dict):
+            merged = dict(existing)
+            if not merged.get("city") and last_val.get("city"):
+                merged["city"] = last_val["city"]
+            if not merged.get("airport_code") and last_val.get("airport_code"):
+                merged["airport_code"] = last_val["airport_code"]
+            if merged != existing:
+                out[key] = merged
+    return out
+
+
 def format_missing_slots(missing_keys: List[str], details: Optional[Dict] = None) -> str:
     """Build a user-facing line listing what's missing (e.g. 'Still needed: • A specific departure date...')."""
     if not missing_keys:

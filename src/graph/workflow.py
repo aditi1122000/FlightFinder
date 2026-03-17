@@ -17,6 +17,7 @@ from src.services.flight_services import (
     extract_conversational_message,
     extract_json_from_response,
     extract_misc_from_response,
+    fill_slots_from_last_search,
     format_departure_date_display,
     format_missing_slots,
     validate_slots,
@@ -47,7 +48,10 @@ def parse_llm_response(state: FlightState) -> FlightState:
     slots_dict = state["slots"]
     slots_context = json.dumps(slots_dict, indent=2)
     today = _current_date_context()
+    user_summary = (state.get("user_summary") or "").strip()
+    user_summary_block = user_summary if user_summary else "None"
     user_message_with_context = f"""[Current date: {today}]
+[User profile summary (from past chats for this user_name): {user_summary_block}]
 [Current booking state: {slots_context}]
 
 User: {state["user_message"]}"""
@@ -94,7 +98,7 @@ User: {state["user_message"]}"""
         state["status"] = status
         logger.info("parse_llm: status=%s missing_slots=%s", status, json_data.get("missing_slots", []))
         if "slots" in json_data:
-            state["slots"] = json_data["slots"]
+            state["slots"] = fill_slots_from_last_search(json_data["slots"], state.get("last_search_params"))
         state["missing_slots"] = json_data.get("missing_slots", [])
     else:
         state["status"] = "error"
@@ -227,9 +231,11 @@ def handle_refining_search(state: FlightState) -> FlightState:
     slots_dict = state["slots"] or {}
     preferences = slots_dict.get("preferences") or {}
     refinement_type = None
+    fd = preferences.get("flexible_dates")
+    flexible_dates_enabled = fd is True or (isinstance(fd, dict) and fd.get("enabled"))
     if preferences.get("nearby_airports"):
         refinement_type = "nearby_airports"
-    elif (preferences.get("flexible_dates") or {}).get("enabled"):
+    elif flexible_dates_enabled:
         refinement_type = "flexible_dates"
     elif preferences.get("max_price") or any(w in (state.get("user_message") or "").lower() for w in ["cheaper", "budget", "low price"]):
         refinement_type = "price_filter"
@@ -278,7 +284,7 @@ def handle_refining_search(state: FlightState) -> FlightState:
         refinement_msg = f"Found {len(refined_flights)} flights from nearby airports"
 
     elif refinement_type == "flexible_dates":
-        base_date = slots_dict.get("departure_date")
+        base_date = slots_dict.get("departure_date") or (state.get("last_search_params") or {}).get("departure_date")
         date_range = generate_flexible_date_range(base_date) if base_date else []
         all_flights = []
         for date in date_range[:5]:

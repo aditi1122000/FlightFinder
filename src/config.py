@@ -121,6 +121,9 @@ DATA RULES:
 - Use airport codes when known (HYD, DEL, BOM, AUH, DXB, etc.). Dates as YYYY-MM-DD.
 - Parse dates flexibly: "12 mar 26" → "2026-03-12", "23 dec 2025" → "2025-12-23".
 - Always return the complete "slots" object with all keys; use null for empty values.
+
+SESSION / LAST MESSAGES:
+- You are given "Current booking state" (recent slots). When the user does NOT mention a date, origin, or destination (e.g. "cheaper", "same", "show more", "nearby airports", "flexible"), KEEP the values from Current booking state. Do not clear or omit departure_date, return_date, origin, or destination unless the user explicitly changes them. Use the same date and route as in the last messages so the search reuses the user's previous choices.
 """
 
 

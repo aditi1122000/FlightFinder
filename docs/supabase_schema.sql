@@ -12,16 +12,27 @@ create table if not exists conversation_messages (
   created_at timestamptz not null default now()
 );
 
--- Optional: index for listing messages by conversation
+
 create index if not exists idx_conversation_messages_conversation_id
-  on conversation_messages (conversation_id, created_at);
--- Optional: index for listing by conversation and turn
+
 create index if not exists idx_conversation_messages_turn
   on conversation_messages (conversation_id, turn_index);
 
--- If table already exists, add columns:
 -- alter table conversation_messages add column if not exists turn_index integer not null default 1;
 -- alter table conversation_messages add column if not exists user_name text;
+
+-- Optional: index for listing messages by user (for summarisation agent)
+create index if not exists idx_conversation_messages_user_name_created
+  on conversation_messages (user_name, created_at)
+  where user_name is not null;
+
+-- User summaries (intent profiling): one row per user_name, updated by summarisation agent
+create table if not exists user_summaries (
+  user_name text primary key,
+  summary_text text not null default '',
+  last_summarised_at timestamptz,
+  updated_at timestamptz not null default now()
+);
 
 -- Optional: RLS (Row Level Security) - enable if you use anon key and want per-user isolation
 -- alter table conversation_messages enable row level security;

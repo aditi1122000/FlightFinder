@@ -39,6 +39,7 @@ from src.services.flight_services import (
     extract_conversational_message,
     extract_json_from_response,
     extract_misc_from_response,
+    fill_slots_from_last_search,
     format_departure_date_display,
     format_missing_slots,
     flights_to_csv,
@@ -54,6 +55,7 @@ from src.services.flight_services import (
     format_price_range,
     resolve_airport_code,
 )
+from src.services.summarisation import ensure_user_summary_updated, get_user_summary
 
 logging.basicConfig(
     level=logging.INFO,
@@ -150,6 +152,7 @@ def handle_user_message_with_graph(user_input: str) -> bool:
             "error_message": None,
             "suggested_alternatives": st.session_state.get("suggested_alternatives"),
             "search_history": st.session_state.get("search_history", []),
+            "user_summary": st.session_state.get("user_summary"),
         }
         msg = random.choice(STATUS_MESSAGES) if STATUS_MESSAGES else "Processing..."
         with st.spinner(msg):
@@ -169,7 +172,10 @@ def process_manual_fallback(user_input: str) -> None:
     recent = history[-MAX_HISTORY:] if len(history) > MAX_HISTORY else history
     conversation_messages = [{"role": m["role"], "content": m["content"]} for m in recent]
     slots_context = json.dumps(st.session_state.slots, indent=2)
-    user_message_with_context = f"""[Current booking state: {slots_context}]
+    user_summary = (st.session_state.get("user_summary") or "").strip()
+    user_summary_block = user_summary if user_summary else "None"
+    user_message_with_context = f"""[User profile summary (from past chats for this user_name): {user_summary_block}]
+[Current booking state: {slots_context}]
 
 User: {user_input}"""
 
@@ -206,7 +212,9 @@ User: {user_input}"""
             json_data = {"status": "error", "slots": st.session_state.slots, "missing_slots": []}
 
     if "slots" in json_data and isinstance(json_data["slots"], dict):
-        st.session_state.slots = json_data["slots"]
+        st.session_state.slots = fill_slots_from_last_search(
+            json_data["slots"], st.session_state.get("last_search_params")
+        )
 
     status = json_data.get("status", "error")
 
@@ -270,9 +278,11 @@ User: {user_input}"""
     elif status == "refining_search":
         preferences = st.session_state.slots.get("preferences") or {}
         refinement_type = None
+        fd = preferences.get("flexible_dates")
+        flexible_dates_enabled = fd is True or (isinstance(fd, dict) and fd.get("enabled"))
         if preferences.get("nearby_airports"):
             refinement_type = "nearby_airports"
-        elif (preferences.get("flexible_dates") or {}).get("enabled"):
+        elif flexible_dates_enabled:
             refinement_type = "flexible_dates"
         elif preferences.get("max_price") or any(w in user_input.lower() for w in ["cheaper", "budget", "low price", "affordable"]):
             refinement_type = "price_filter"
@@ -315,7 +325,7 @@ User: {user_input}"""
             refined = all_f[:10]
             msg_extra = f"Found {len(refined)} flights from nearby airports"
         elif refinement_type == "flexible_dates":
-            base = st.session_state.slots.get("departure_date")
+            base = st.session_state.slots.get("departure_date") or (st.session_state.get("last_search_params") or {}).get("departure_date")
             dates = generate_flexible_date_range(base) if base else []
             all_f = []
             for d in dates[:5]:
@@ -406,6 +416,8 @@ def main() -> None:
         st.session_state.price_stats = None
     if "suggested_alternatives" not in st.session_state:
         st.session_state.suggested_alternatives = None
+    if "user_summary" not in st.session_state:
+        st.session_state.user_summary = None
     if LANGGRAPH_AVAILABLE and "flight_graph" not in st.session_state:
         try:
             st.session_state.flight_graph = create_flight_finder_graph()
@@ -508,6 +520,15 @@ I'm here to help you search for flights in plain language. Tell me where you wan
     st.session_state.is_calling_model = True
     _append_message("user", user_input)
     logger.info("Processing user message (len=%d), trying graph first", len(user_input or ""))
+
+    # Refresh user-level summary (delta update) for prompt conditioning.
+    # Uses user_name (cross-chat), not conversation_id.
+    try:
+        ensure_user_summary_updated(st.session_state.user_name)
+        row = get_user_summary(st.session_state.user_name) or {}
+        st.session_state.user_summary = (row.get("summary_text") or "").strip() or None
+    except Exception as e:
+        logger.debug("User summary update skipped: %s", e)
 
     try:
         if handle_user_message_with_graph(user_input):

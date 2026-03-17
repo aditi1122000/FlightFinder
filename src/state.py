@@ -60,3 +60,4 @@ class FlightState(TypedDict):
     error_message: Optional[str]
     suggested_alternatives: Optional[Dict[str, Any]]
     search_history: Annotated[List[Dict[str, Any]], operator.add]
+    user_summary: Optional[str]
