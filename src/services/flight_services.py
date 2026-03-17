@@ -78,7 +78,7 @@ def _slot_codes_list(slot: dict, max_codes: int = 5) -> List[str]:
 def _get_client():
     global _client
     if _client is None:
-        from mistralai import Mistral
+        from mistralai.client import Mistral
         _client = Mistral(api_key=MISTRAL_API_KEY)
     return _client
 
