@@ -29,6 +29,8 @@ BASE_DELAY = 2.0
 PROTECTIVE_SLEEP = 1.1
 RATE_LIMIT_RETRIES = 0  # fail immediately on 429 — retries dig a deeper hole
 RATE_LIMIT_WAIT_SECONDS = 2.5
+# After a 429, block further Mistral calls in this browser session
+RATE_LIMIT_COOLDOWN_SECONDS = 90
 # Intent profiling burns an extra Mistral call before chat; keep off until quota is healthy
 ENABLE_USER_SUMMARY_UPDATE = False
 

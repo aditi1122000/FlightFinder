@@ -14,6 +14,7 @@ import json
 import logging
 import random
 import re
+import time
 import uuid
 
 import streamlit as st
@@ -44,6 +45,7 @@ from src.config import (
     SYSTEM_PROMPT,
     ERROR_MESSAGES,
     ENABLE_USER_SUMMARY_UPDATE,
+    RATE_LIMIT_COOLDOWN_SECONDS,
 )
 from src.services.flight_services import (
     RateLimitError,
@@ -459,6 +461,8 @@ def main() -> None:
         st.session_state.suggested_alternatives = None
     if "user_summary" not in st.session_state:
         st.session_state.user_summary = None
+    if "rate_limit_until" not in st.session_state:
+        st.session_state.rate_limit_until = 0.0
     if LANGGRAPH_AVAILABLE and "flight_graph" not in st.session_state:
         try:
             st.session_state.flight_graph = create_flight_finder_graph()
@@ -558,6 +562,16 @@ I'm here to help you search for flights in plain language. Tell me where you wan
         st.warning("Processing previous request — please wait.")
         return
 
+    # Hard cooldown after a 429 so rapid retries don't keep the Mistral bucket empty
+    now = time.time()
+    cooldown_until = float(st.session_state.get("rate_limit_until") or 0)
+    if now < cooldown_until:
+        remaining = int(cooldown_until - now) + 1
+        st.warning(
+            f"Rate-limit cooldown active — wait **{remaining}s**, then send one message."
+        )
+        return
+
     st.session_state.is_calling_model = True
     _append_message("user", user_input)
     logger.info("Processing user message (len=%d), trying graph first", len(user_input or ""))
@@ -586,6 +600,7 @@ I'm here to help you search for flights in plain language. Tell me where you wan
             st.rerun()
     except RateLimitError as e:
         logger.warning("Rate limited while processing message: %s", e)
+        st.session_state.rate_limit_until = time.time() + RATE_LIMIT_COOLDOWN_SECONDS
         msg = ERROR_MESSAGES.get("rate_limit") or str(e)
         # Do not persist rate-limit errors — they re-trigger summariser next turn
         st.session_state.chat_history.append({"role": "assistant", "content": msg})
@@ -594,6 +609,7 @@ I'm here to help you search for flights in plain language. Tell me where you wan
     except Exception as e:
         if _exception_is_rate_limit(e):
             logger.warning("Rate limited (wrapped) while processing message: %s", e)
+            st.session_state.rate_limit_until = time.time() + RATE_LIMIT_COOLDOWN_SECONDS
             msg = ERROR_MESSAGES.get("rate_limit") or str(e)
             st.session_state.chat_history.append({"role": "assistant", "content": msg})
             st.warning(msg)
