@@ -43,8 +43,8 @@ RATE_LIMIT_RETRIES = 0  # fail immediately on 429 — retries dig a deeper hole
 RATE_LIMIT_WAIT_SECONDS = 2.5
 # After a 429, block further LLM calls in this browser session
 RATE_LIMIT_COOLDOWN_SECONDS = 90
-# Intent profiling burns an extra LLM call before chat; keep off until quota is healthy
-ENABLE_USER_SUMMARY_UPDATE = False
+# Intent profiling (user summary) — safe again on Gemini; was off during Mistral 429s
+ENABLE_USER_SUMMARY_UPDATE = True
 
 
 # Default booking slots (empty state)

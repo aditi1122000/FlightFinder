@@ -576,9 +576,8 @@ I'm here to help you search for flights in plain language. Tell me where you wan
     _append_message("user", user_input)
     logger.info("Processing user message (len=%d), trying graph first", len(user_input or ""))
 
-    # Load cached user profile only — do NOT call Mistral here.
-    # ensure_user_summary_updated was burning the 1 RPS budget before every
-    # chat, then parse_llm also 429'd (death spiral with persisted error msgs).
+    # Refresh user-level summary (intent profiling) for prompt conditioning.
+    # Uses Gemini now; skipped automatically if rate-limited.
     try:
         if ENABLE_USER_SUMMARY_UPDATE:
             ensure_user_summary_updated(st.session_state.user_name)
