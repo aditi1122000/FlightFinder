@@ -10,6 +10,7 @@ load_dotenv(".env")
 # API keys and URLs
 
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 FLIGHT_API_KEY = os.getenv("FLIGHT_API_KEY")
 FLIGHT_API_BASE_URL = os.getenv("FLIGHT_API_BASE_URL", "")
 AIRPORT_API_KEY = os.getenv("AIRPORT_API_KEY")
@@ -20,18 +21,29 @@ RAPIDAPI_HOST = os.getenv("RapidAPIHost") or os.getenv("RAPIDAPI_HOST")
 
 # LLM and app constants
 
-MODEL_NAME = "mistral-medium-latest"
+# gemini | mistral — use gemini while Mistral is rate-limited
+LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "gemini").strip().lower()
+# Prefer stable flash models available to new free-tier keys.
+# gemini-2.5-pro / gemini-flash-latest are often blocked or overloaded.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.6-flash"
+GEMINI_FALLBACK_MODELS = [
+    m.strip()
+    for m in (os.getenv("GEMINI_FALLBACK_MODELS") or "gemini-3.5-flash,gemini-3.6-flash").split(",")
+    if m.strip()
+]
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL") or "mistral-medium-latest"
+MODEL_NAME = GEMINI_MODEL if LLM_PROVIDER == "gemini" else MISTRAL_MODEL
 MAX_HISTORY = 10
 MAX_TOKENS_LLM = 1500
 # Mistral Free/experiment: often 1 request/second. Never burst-retry on 429.
 RETRIES = 2
 BASE_DELAY = 2.0
-PROTECTIVE_SLEEP = 1.1
+PROTECTIVE_SLEEP = 0.3 if LLM_PROVIDER == "gemini" else 1.1
 RATE_LIMIT_RETRIES = 0  # fail immediately on 429 — retries dig a deeper hole
 RATE_LIMIT_WAIT_SECONDS = 2.5
-# After a 429, block further Mistral calls in this browser session
+# After a 429, block further LLM calls in this browser session
 RATE_LIMIT_COOLDOWN_SECONDS = 90
-# Intent profiling burns an extra Mistral call before chat; keep off until quota is healthy
+# Intent profiling burns an extra LLM call before chat; keep off until quota is healthy
 ENABLE_USER_SUMMARY_UPDATE = False
 
 

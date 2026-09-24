@@ -16,11 +16,15 @@ from typing import Dict, List, Optional, Tuple
 
 from src.config import (
     MISTRAL_API_KEY,
+    GEMINI_API_KEY,
     AIRPORT_API_KEY,
     AIRPORT_API_BASE_URL,
     RAPIDAPI_KEY,
     RAPIDAPI_HOST,
     MODEL_NAME,
+    LLM_PROVIDER,
+    GEMINI_MODEL,
+    GEMINI_FALLBACK_MODELS,
     MAX_HISTORY,
     RETRIES,
     BASE_DELAY,
@@ -33,7 +37,25 @@ from src.config import (
 
 
 class RateLimitError(Exception):
-    """Raised when Mistral returns 429 / rate_limited. Callers must not retry another path."""
+    """Raised when the LLM returns 429 / rate_limited. Callers must not retry another path."""
+
+
+class _SimpleMessage:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class _SimpleChoice:
+    def __init__(self, content: str):
+        self.message = _SimpleMessage(content)
+
+
+class _SimpleChatResponse:
+    """Mistral-compatible response shape: response.choices[0].message.content"""
+
+    def __init__(self, content: str):
+        self.choices = [_SimpleChoice(content)]
+
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +146,179 @@ def _get_client():
             _client = Mistral(api_key=api_key)
             _client._garudax_api_key = api_key  # type: ignore[attr-defined]
     return _client
+
+
+def _gemini_api_key() -> str:
+    return (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or GEMINI_API_KEY or "").strip()
+
+
+def _messages_to_gemini(messages: List[Dict]) -> Tuple[Optional[str], List[Dict]]:
+    """Convert OpenAI/Mistral-style messages to Gemini contents + system instruction."""
+    system_parts: List[str] = []
+    contents: List[Dict] = []
+    for m in messages or []:
+        role = (m.get("role") or "user").strip().lower()
+        content = m.get("content")
+        if content is None:
+            continue
+        text = content if isinstance(content, str) else str(content)
+        if not text.strip():
+            continue
+        if role == "system":
+            system_parts.append(text)
+            continue
+        gemini_role = "model" if role in ("assistant", "model") else "user"
+        # Gemini requires alternating user/model; merge consecutive same-role turns
+        if contents and contents[-1]["role"] == gemini_role:
+            contents[-1]["parts"][0]["text"] += "\n\n" + text
+        else:
+            contents.append({"role": gemini_role, "parts": [{"text": text}]})
+    system_instruction = "\n\n".join(system_parts).strip() or None
+    return system_instruction, contents
+
+
+def _extract_gemini_text(data: Dict) -> str:
+    candidates = data.get("candidates") or []
+    if not candidates:
+        # Blocked / empty
+        feedback = data.get("promptFeedback") or data.get("error") or data
+        raise Exception(f"Gemini returned no candidates: {feedback}")
+    parts = (((candidates[0] or {}).get("content") or {}).get("parts")) or []
+    texts = []
+    for p in parts:
+        if isinstance(p, dict) and p.get("text"):
+            texts.append(p["text"])
+    text = "\n".join(texts).strip()
+    if not text:
+        raise Exception(f"Gemini returned empty text: {candidates[0]}")
+    return text
+
+
+def _call_gemini_once(payload: Dict) -> _SimpleChatResponse:
+    api_key = _gemini_api_key()
+    if not api_key:
+        raise ValueError(
+            "GEMINI_API_KEY is missing. Set it in Streamlit Secrets or .env."
+        )
+    primary = (payload.get("model") or os.getenv("GEMINI_MODEL") or GEMINI_MODEL or MODEL_NAME).strip()
+    candidates = [primary]
+    for m in GEMINI_FALLBACK_MODELS:
+        if m and m not in candidates:
+            candidates.append(m)
+
+    system_instruction, contents = _messages_to_gemini(payload.get("messages") or [])
+    if not contents:
+        raise ValueError("Gemini payload has no user/model messages")
+
+    body: Dict = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": float(payload.get("temperature", 0.2)),
+            # Gemini 3.x thinking models burn tokens on "thoughts"; keep budget 0 for chat.
+            "maxOutputTokens": max(int(payload.get("max_tokens") or 1500), 1024),
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+    if system_instruction:
+        body["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+
+    last_err: Optional[Exception] = None
+    for model in candidates:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        resp = requests.post(
+            url,
+            headers={
+                "Content-Type": "application/json",
+                "X-goog-api-key": api_key,
+            },
+            json=body,
+            timeout=60,
+        )
+        if resp.status_code == 429:
+            raise RateLimitError(
+                f"Gemini rate limit exceeded ({model}). Wait ~1–2 minutes, then send one message. "
+                f"Details: {resp.text}"
+            )
+        if resp.status_code in (503, 404) or (
+            resp.status_code >= 400
+            and any(k in (resp.text or "").lower() for k in ("high demand", "unavailable", "no longer available"))
+        ):
+            last_err = Exception(f"Gemini API error {resp.status_code} ({model}): {resp.text}")
+            logger.warning("Gemini model %s failed (%s); trying next fallback", model, resp.status_code)
+            continue
+        if resp.status_code >= 400:
+            raise Exception(f"Gemini API error {resp.status_code} ({model}): {resp.text}")
+        data = resp.json()
+        logger.info("Gemini response from model=%s", model)
+        return _SimpleChatResponse(_extract_gemini_text(data))
+
+    if last_err is not None:
+        raise last_err
+    raise Exception("Gemini call failed with no model candidates")
+
+
+def _call_mistral_once(payload: Dict):
+    client = _get_client()
+    return client.chat.complete(**payload)
+
+
+def call_mistral_with_backoff(payload: Dict, retries: int = RETRIES, base_delay: float = BASE_DELAY):
+    """
+    Call the configured LLM (Gemini or Mistral) with limited retries.
+
+    Keeps the historical function name so workflow/app imports stay unchanged.
+    Response always exposes: response.choices[0].message.content
+    """
+    provider = (os.getenv("LLM_PROVIDER") or LLM_PROVIDER or "gemini").strip().lower()
+    last_exc = None
+    rate_limit_attempts = 0
+
+    for attempt in range(retries):
+        try:
+            if provider == "gemini":
+                resp = _call_gemini_once(payload)
+            else:
+                resp = _call_mistral_once(payload)
+            time.sleep(PROTECTIVE_SLEEP)
+            return resp
+        except RateLimitError:
+            raise
+        except Exception as e:
+            last_exc = e
+            if _is_rate_limit_error(e):
+                if rate_limit_attempts < RATE_LIMIT_RETRIES:
+                    rate_limit_attempts += 1
+                    wait = RATE_LIMIT_WAIT_SECONDS + random.uniform(0, 0.5)
+                    logger.warning(
+                        "%s rate limited (attempt %d/%d); waiting %.1fs",
+                        provider,
+                        rate_limit_attempts,
+                        RATE_LIMIT_RETRIES,
+                        wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                logger.warning("%s rate limited — stopping without further retries", provider)
+                raise RateLimitError(
+                    f"{provider} rate limit exceeded. Wait ~1–2 minutes, then send one message. "
+                    f"Details: {e}"
+                ) from e
+
+            err_text = str(e).lower()
+            if any(
+                k in err_text
+                for k in ("capacity", "overloaded", "timeout", "unavailable", "high demand", "503")
+            ):
+                backoff = base_delay * (2 ** attempt)
+                time.sleep(backoff + random.uniform(0, backoff * 0.3))
+                continue
+            raise
+
+    if last_exc is not None and _is_rate_limit_error(last_exc):
+        raise RateLimitError(
+            f"{provider} rate limit exceeded after retries. Last error: {last_exc}"
+        ) from last_exc
+    raise Exception(f"Failed after {retries} retries. Last error: {last_exc}")
 
 
 def clean_json_text(text: str) -> str:
@@ -256,56 +451,6 @@ def _is_rate_limit_error(exc: Exception) -> bool:
         k in err_text
         for k in ("429", "rate_limited", "rate limit", "too many requests")
     )
-
-
-def call_mistral_with_backoff(payload: Dict, retries: int = RETRIES, base_delay: float = BASE_DELAY):
-    """
-    Call Mistral chat completions with limited retries.
-
-    On 429 / rate_limited: do not burst-retry (RATE_LIMIT_RETRIES is usually 0).
-    Mistral medium is often capped at 1 request/second; retries dig a deeper hole.
-    """
-    client = _get_client()
-    last_exc = None
-    rate_limit_attempts = 0
-
-    for attempt in range(retries):
-        try:
-            resp = client.chat.complete(**payload)
-            time.sleep(PROTECTIVE_SLEEP)
-            return resp
-        except Exception as e:
-            last_exc = e
-            if _is_rate_limit_error(e):
-                if rate_limit_attempts < RATE_LIMIT_RETRIES:
-                    rate_limit_attempts += 1
-                    wait = RATE_LIMIT_WAIT_SECONDS + random.uniform(0, 0.5)
-                    logger.warning(
-                        "Mistral rate limited (attempt %d/%d); waiting %.1fs",
-                        rate_limit_attempts,
-                        RATE_LIMIT_RETRIES,
-                        wait,
-                    )
-                    time.sleep(wait)
-                    continue
-                logger.warning("Mistral rate limited — stopping without further retries")
-                raise RateLimitError(
-                    "Mistral rate limit exceeded. Wait ~1–2 minutes, then send one message. "
-                    f"Details: {e}"
-                ) from e
-
-            err_text = str(e).lower()
-            if any(k in err_text for k in ("capacity", "overloaded", "timeout")):
-                backoff = base_delay * (2 ** attempt)
-                time.sleep(backoff + random.uniform(0, backoff * 0.3))
-                continue
-            raise
-
-    if last_exc is not None and _is_rate_limit_error(last_exc):
-        raise RateLimitError(
-            f"Mistral rate limit exceeded after retries. Last error: {last_exc}"
-        ) from last_exc
-    raise Exception(f"Failed after {retries} retries. Last error: {last_exc}")
 
 
 def format_booking_details(slots: Dict) -> str:
