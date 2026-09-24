@@ -26,15 +26,26 @@ STATUS_MESSAGES = [
     "Almost there — polishing results…",
 ]
 
+# Streamlit Cloud injects secrets into the environment. Always prefer
+# st.secrets so a fixed key overwrites a stale/mashed env value from an
+# earlier bad Secrets paste.
 try:
     for key, value in st.secrets.items():
-        if isinstance(value, str) and key not in os.environ:
-            os.environ[key] = value
+        if isinstance(value, str) and value.strip():
+            os.environ[key] = value.strip()
 except Exception:
     pass
 
-from src.config import DEFAULT_SLOTS, MODEL_NAME, MAX_HISTORY, MAX_TOKENS_LLM, SYSTEM_PROMPT
+from src.config import (
+    DEFAULT_SLOTS,
+    MODEL_NAME,
+    MAX_HISTORY,
+    MAX_TOKENS_LLM,
+    SYSTEM_PROMPT,
+    ERROR_MESSAGES,
+)
 from src.services.flight_services import (
+    RateLimitError,
     call_mistral_with_backoff,
     extract_conversational_message,
     extract_json_from_response,
@@ -131,7 +142,11 @@ def _apply_graph_result(final_state: dict) -> None:
 
 
 def handle_user_message_with_graph(user_input: str) -> bool:
-    """Process user message via LangGraph (runs in main thread so result is always applied)."""
+    """Process user message via LangGraph (runs in main thread so result is always applied).
+
+    Returns True if the graph handled the message.
+    Raises RateLimitError so the caller does NOT fall back to another LLM path.
+    """
     if not LANGGRAPH_AVAILABLE or "flight_graph" not in st.session_state:
         logger.debug("handle_user_message_with_graph: skip graph (available=%s has_graph=%s)", LANGGRAPH_AVAILABLE, "flight_graph" in st.session_state)
         return False
@@ -160,10 +175,30 @@ def handle_user_message_with_graph(user_input: str) -> bool:
         logger.info("handle_user_message_with_graph: graph done status=%s", final_state.get("status"))
         _apply_graph_result(final_state)
         return True
+    except RateLimitError:
+        raise
     except Exception as e:
+        # Unwrap nested rate-limit from LangGraph task exceptions
+        if _exception_is_rate_limit(e):
+            raise RateLimitError(str(e)) from e
         logger.exception("handle_user_message_with_graph: LangGraph error")
         st.error(f"LangGraph error: {e}")
         return False
+
+
+def _exception_is_rate_limit(exc: BaseException) -> bool:
+    """True if this exception (or its cause chain) is a Mistral rate limit."""
+    cur = exc
+    seen = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, RateLimitError):
+            return True
+        text = str(cur).lower()
+        if any(k in text for k in ("429", "rate_limited", "rate limit", "too many requests")):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 def process_manual_fallback(user_input: str) -> None:
@@ -280,11 +315,16 @@ User: {user_input}"""
         refinement_type = None
         fd = preferences.get("flexible_dates")
         flexible_dates_enabled = fd is True or (isinstance(fd, dict) and fd.get("enabled"))
+        user_lower = (user_input or "").lower()
+        price_words = ["cheaper", "cheapest", "budget", "low price", "affordable", "lowest", "minimum"]
+        user_wants_cheaper = any(w in user_lower for w in price_words)
         if preferences.get("nearby_airports"):
             refinement_type = "nearby_airports"
+        elif user_wants_cheaper or preferences.get("max_price"):
+            refinement_type = "price_filter"
         elif flexible_dates_enabled:
             refinement_type = "flexible_dates"
-        elif preferences.get("max_price") or any(w in user_input.lower() for w in ["cheaper", "budget", "low price", "affordable"]):
+        else:
             refinement_type = "price_filter"
         refined = []
         msg_extra = ""
@@ -523,10 +563,18 @@ I'm here to help you search for flights in plain language. Tell me where you wan
 
     # Refresh user-level summary (delta update) for prompt conditioning.
     # Uses user_name (cross-chat), not conversation_id.
+    # If summariser hits Mistral, wait so we stay under the 1 RPS workspace cap
+    # before parse_llm runs.
     try:
+        import time as _time
+        summary_before = (st.session_state.get("user_summary") or "").strip()
         ensure_user_summary_updated(st.session_state.user_name)
         row = get_user_summary(st.session_state.user_name) or {}
         st.session_state.user_summary = (row.get("summary_text") or "").strip() or None
+        if (st.session_state.user_summary or "") != summary_before:
+            _time.sleep(1.1)
+    except RateLimitError as e:
+        logger.warning("User summary skipped due to rate limit: %s", e)
     except Exception as e:
         logger.debug("User summary update skipped: %s", e)
 
@@ -534,14 +582,29 @@ I'm here to help you search for flights in plain language. Tell me where you wan
         if handle_user_message_with_graph(user_input):
             st.rerun()
         else:
+            # Only use manual path when LangGraph is unavailable — never as a
+            # second LLM attempt after a rate-limit failure.
             with st.spinner(random.choice(STATUS_MESSAGES) if STATUS_MESSAGES else "Thinking..."):
                 process_manual_fallback(user_input)
             st.rerun()
-    except Exception as e:
-        logger.exception("Error processing message")
-        _append_message("assistant", f"I encountered an error: {e}. Please try again.")
-        st.error(str(e))
+    except RateLimitError as e:
+        logger.warning("Rate limited while processing message: %s", e)
+        msg = ERROR_MESSAGES.get("rate_limit") or str(e)
+        _append_message("assistant", msg)
+        st.warning(msg)
         st.rerun()
+    except Exception as e:
+        if _exception_is_rate_limit(e):
+            logger.warning("Rate limited (wrapped) while processing message: %s", e)
+            msg = ERROR_MESSAGES.get("rate_limit") or str(e)
+            _append_message("assistant", msg)
+            st.warning(msg)
+            st.rerun()
+        else:
+            logger.exception("Error processing message")
+            _append_message("assistant", f"I encountered an error: {e}. Please try again.")
+            st.error(str(e))
+            st.rerun()
     finally:
         st.session_state.is_calling_model = False
 

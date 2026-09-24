@@ -1,5 +1,6 @@
 """Services: LLM, flight search, validation, and formatting."""
 from src.services.flight_services import (
+    RateLimitError,
     call_mistral_with_backoff,
     extract_conversational_message,
     extract_json_from_response,
@@ -20,6 +21,7 @@ from src.services.flight_services import (
 )
 
 __all__ = [
+    "RateLimitError",
     "call_mistral_with_backoff",
     "extract_conversational_message",
     "extract_json_from_response",

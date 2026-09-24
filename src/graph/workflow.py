@@ -233,12 +233,17 @@ def handle_refining_search(state: FlightState) -> FlightState:
     refinement_type = None
     fd = preferences.get("flexible_dates")
     flexible_dates_enabled = fd is True or (isinstance(fd, dict) and fd.get("enabled"))
+    user_lower = (state.get("user_message") or "").lower()
+    price_words = ["cheaper", "cheapest", "budget", "low price", "affordable", "lowest", "minimum"]
+    user_wants_cheaper = any(w in user_lower for w in price_words)
     if preferences.get("nearby_airports"):
         refinement_type = "nearby_airports"
+    elif user_wants_cheaper or preferences.get("max_price"):
+        refinement_type = "price_filter"
     elif flexible_dates_enabled:
         refinement_type = "flexible_dates"
-    elif preferences.get("max_price") or any(w in (state.get("user_message") or "").lower() for w in ["cheaper", "budget", "low price"]):
-        refinement_type = "price_filter"
+    else:
+        refinement_type = "price_filter"  # default refinement to price when unclear
 
     refined_flights = []
     refinement_msg = ""

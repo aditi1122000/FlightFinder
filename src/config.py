@@ -23,9 +23,13 @@ RAPIDAPI_HOST = os.getenv("RapidAPIHost") or os.getenv("RAPIDAPI_HOST")
 MODEL_NAME = "mistral-medium-latest"
 MAX_HISTORY = 10
 MAX_TOKENS_LLM = 1500
-RETRIES = 4
-BASE_DELAY = 1.0
-PROTECTIVE_SLEEP = 0.5
+# Mistral Free/experiment caps are often 1 request/second for medium.
+# Keep retries low and waits above 1s so we do not dig a deeper 429 hole.
+RETRIES = 2
+BASE_DELAY = 2.0
+PROTECTIVE_SLEEP = 1.1
+RATE_LIMIT_RETRIES = 1
+RATE_LIMIT_WAIT_SECONDS = 2.5
 
 
 # Default booking slots (empty state)
@@ -106,7 +110,7 @@ STATUS MEANINGS:
 - clarification_needed: origin, destination, or departure_date missing
 - update: slots updated but not yet ready to search; also use for special requests (table, summary, etc.) so no new search runs
 - ready_for_search: origin, destination, departure_date present
-- refining_search: user wants cheaper / nearby airports / flexible dates
+- refining_search: user wants cheaper / nearby airports / flexible dates. If the user only asks for cheaper/budget/affordable (no mention of "flexible dates" or "other dates"), set preferences.flexible_dates to false and keep departure_date from Current booking state so the system filters by price on the same date.
 - awaiting_confirmation: ambiguous input (e.g. airport), need user to pick
 - error: something went wrong
 
@@ -150,4 +154,8 @@ ERROR_MESSAGES = {
     "invalid_date": "Please provide a valid date in the future.",
     "missing_info": "I need more information to search for flights.",
     "format_error": "I couldn't process that. Please try again.",
+    "rate_limit": (
+        "I'm temporarily rate-limited by the AI provider (1 request/second cap). "
+        "Please wait about a minute, then send **one** message — don't retry quickly."
+    ),
 }

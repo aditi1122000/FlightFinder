@@ -25,9 +25,15 @@ from src.config import (
     RETRIES,
     BASE_DELAY,
     PROTECTIVE_SLEEP,
+    RATE_LIMIT_RETRIES,
+    RATE_LIMIT_WAIT_SECONDS,
     ERROR_MESSAGES,
     MISSING_SLOT_LABELS,
 )
+
+
+class RateLimitError(Exception):
+    """Raised when Mistral returns 429 / rate_limited. Callers must not retry another path."""
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +106,23 @@ def _slot_codes_list(slot: dict, max_codes: int = 5) -> List[str]:
 
 def _get_client():
     global _client
+    # Prefer live env (Streamlit secrets) over the value captured at import time
+    api_key = (os.getenv("MISTRAL_API_KEY") or MISTRAL_API_KEY or "").strip()
+    if not api_key:
+        raise ValueError(
+            "MISTRAL_API_KEY is missing. Set it in Streamlit Secrets or .env."
+        )
     if _client is None:
         from mistralai.client import Mistral
-        _client = Mistral(api_key=MISTRAL_API_KEY)
+        _client = Mistral(api_key=api_key)
+        _client._garudax_api_key = api_key  # type: ignore[attr-defined]
+    else:
+        # Rebuild client if secrets changed after a reboot/hot-reload
+        prev = getattr(_client, "_garudax_api_key", None)
+        if prev != api_key:
+            from mistralai.client import Mistral
+            _client = Mistral(api_key=api_key)
+            _client._garudax_api_key = api_key  # type: ignore[attr-defined]
     return _client
 
 
@@ -230,22 +250,62 @@ def extract_conversational_message(text: str) -> str:
     return text if text else "I understand. Let me help you with that."
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    err_text = str(exc).lower()
+    return any(
+        k in err_text
+        for k in ("429", "rate_limited", "rate limit", "too many requests")
+    )
+
+
 def call_mistral_with_backoff(payload: Dict, retries: int = RETRIES, base_delay: float = BASE_DELAY):
+    """
+    Call Mistral chat completions with limited retries.
+
+    Rate-limit (429) is handled separately: at most RATE_LIMIT_RETRIES extra
+    attempts after waiting RATE_LIMIT_WAIT_SECONDS. Do not burst retries —
+    Mistral medium is often capped at 1 request/second.
+    """
     client = _get_client()
     last_exc = None
+    rate_limit_attempts = 0
+
     for attempt in range(retries):
         try:
             resp = client.chat.complete(**payload)
+            # Stay under typical 1 RPS workspace caps
             time.sleep(PROTECTIVE_SLEEP)
             return resp
         except Exception as e:
             last_exc = e
+            if _is_rate_limit_error(e):
+                if rate_limit_attempts < RATE_LIMIT_RETRIES:
+                    rate_limit_attempts += 1
+                    wait = RATE_LIMIT_WAIT_SECONDS + random.uniform(0, 0.5)
+                    logger.warning(
+                        "Mistral rate limited (attempt %d/%d); waiting %.1fs",
+                        rate_limit_attempts,
+                        RATE_LIMIT_RETRIES,
+                        wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise RateLimitError(
+                    "Mistral rate limit exceeded. Wait ~30–60 seconds, then send one message. "
+                    f"Details: {e}"
+                ) from e
+
             err_text = str(e).lower()
-            if any(k in err_text for k in ("capacity", "rate", "limit")):
+            if any(k in err_text for k in ("capacity", "overloaded", "timeout")):
                 backoff = base_delay * (2 ** attempt)
                 time.sleep(backoff + random.uniform(0, backoff * 0.3))
                 continue
             raise
+
+    if last_exc is not None and _is_rate_limit_error(last_exc):
+        raise RateLimitError(
+            f"Mistral rate limit exceeded after retries. Last error: {last_exc}"
+        ) from last_exc
     raise Exception(f"Failed after {retries} retries. Last error: {last_exc}")
 
 
