@@ -262,9 +262,8 @@ def call_mistral_with_backoff(payload: Dict, retries: int = RETRIES, base_delay:
     """
     Call Mistral chat completions with limited retries.
 
-    Rate-limit (429) is handled separately: at most RATE_LIMIT_RETRIES extra
-    attempts after waiting RATE_LIMIT_WAIT_SECONDS. Do not burst retries —
-    Mistral medium is often capped at 1 request/second.
+    On 429 / rate_limited: do not burst-retry (RATE_LIMIT_RETRIES is usually 0).
+    Mistral medium is often capped at 1 request/second; retries dig a deeper hole.
     """
     client = _get_client()
     last_exc = None
@@ -273,7 +272,6 @@ def call_mistral_with_backoff(payload: Dict, retries: int = RETRIES, base_delay:
     for attempt in range(retries):
         try:
             resp = client.chat.complete(**payload)
-            # Stay under typical 1 RPS workspace caps
             time.sleep(PROTECTIVE_SLEEP)
             return resp
         except Exception as e:
@@ -290,8 +288,9 @@ def call_mistral_with_backoff(payload: Dict, retries: int = RETRIES, base_delay:
                     )
                     time.sleep(wait)
                     continue
+                logger.warning("Mistral rate limited — stopping without further retries")
                 raise RateLimitError(
-                    "Mistral rate limit exceeded. Wait ~30–60 seconds, then send one message. "
+                    "Mistral rate limit exceeded. Wait ~1–2 minutes, then send one message. "
                     f"Details: {e}"
                 ) from e
 

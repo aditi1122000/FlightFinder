@@ -23,13 +23,14 @@ RAPIDAPI_HOST = os.getenv("RapidAPIHost") or os.getenv("RAPIDAPI_HOST")
 MODEL_NAME = "mistral-medium-latest"
 MAX_HISTORY = 10
 MAX_TOKENS_LLM = 1500
-# Mistral Free/experiment caps are often 1 request/second for medium.
-# Keep retries low and waits above 1s so we do not dig a deeper 429 hole.
+# Mistral Free/experiment: often 1 request/second. Never burst-retry on 429.
 RETRIES = 2
 BASE_DELAY = 2.0
 PROTECTIVE_SLEEP = 1.1
-RATE_LIMIT_RETRIES = 1
+RATE_LIMIT_RETRIES = 0  # fail immediately on 429 — retries dig a deeper hole
 RATE_LIMIT_WAIT_SECONDS = 2.5
+# Intent profiling burns an extra Mistral call before chat; keep off until quota is healthy
+ENABLE_USER_SUMMARY_UPDATE = False
 
 
 # Default booking slots (empty state)
@@ -155,7 +156,7 @@ ERROR_MESSAGES = {
     "missing_info": "I need more information to search for flights.",
     "format_error": "I couldn't process that. Please try again.",
     "rate_limit": (
-        "I'm temporarily rate-limited by the AI provider (1 request/second cap). "
-        "Please wait about a minute, then send **one** message — don't retry quickly."
+        "I'm temporarily rate-limited by the AI provider. "
+        "Please wait **1–2 minutes**, then send **one** short message — don't retry quickly."
     ),
 }

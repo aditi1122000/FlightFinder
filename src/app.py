@@ -43,6 +43,7 @@ from src.config import (
     MAX_TOKENS_LLM,
     SYSTEM_PROMPT,
     ERROR_MESSAGES,
+    ENABLE_USER_SUMMARY_UPDATE,
 )
 from src.services.flight_services import (
     RateLimitError,
@@ -561,18 +562,14 @@ I'm here to help you search for flights in plain language. Tell me where you wan
     _append_message("user", user_input)
     logger.info("Processing user message (len=%d), trying graph first", len(user_input or ""))
 
-    # Refresh user-level summary (delta update) for prompt conditioning.
-    # Uses user_name (cross-chat), not conversation_id.
-    # If summariser hits Mistral, wait so we stay under the 1 RPS workspace cap
-    # before parse_llm runs.
+    # Load cached user profile only — do NOT call Mistral here.
+    # ensure_user_summary_updated was burning the 1 RPS budget before every
+    # chat, then parse_llm also 429'd (death spiral with persisted error msgs).
     try:
-        import time as _time
-        summary_before = (st.session_state.get("user_summary") or "").strip()
-        ensure_user_summary_updated(st.session_state.user_name)
+        if ENABLE_USER_SUMMARY_UPDATE:
+            ensure_user_summary_updated(st.session_state.user_name)
         row = get_user_summary(st.session_state.user_name) or {}
         st.session_state.user_summary = (row.get("summary_text") or "").strip() or None
-        if (st.session_state.user_summary or "") != summary_before:
-            _time.sleep(1.1)
     except RateLimitError as e:
         logger.warning("User summary skipped due to rate limit: %s", e)
     except Exception as e:
@@ -590,14 +587,15 @@ I'm here to help you search for flights in plain language. Tell me where you wan
     except RateLimitError as e:
         logger.warning("Rate limited while processing message: %s", e)
         msg = ERROR_MESSAGES.get("rate_limit") or str(e)
-        _append_message("assistant", msg)
+        # Do not persist rate-limit errors — they re-trigger summariser next turn
+        st.session_state.chat_history.append({"role": "assistant", "content": msg})
         st.warning(msg)
         st.rerun()
     except Exception as e:
         if _exception_is_rate_limit(e):
             logger.warning("Rate limited (wrapped) while processing message: %s", e)
             msg = ERROR_MESSAGES.get("rate_limit") or str(e)
-            _append_message("assistant", msg)
+            st.session_state.chat_history.append({"role": "assistant", "content": msg})
             st.warning(msg)
             st.rerun()
         else:
