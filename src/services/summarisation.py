@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.config import MODEL_NAME
-from src.services.flight_services import call_mistral_with_backoff
+from src.services.flight_services import GenerationCancelled, call_mistral_with_backoff
 from src.services.supabase_persistence import _get_client
 
 logger = logging.getLogger(__name__)
@@ -181,6 +181,8 @@ def ensure_user_summary_updated(user_name: str) -> Optional[str]:
         client.table(SUMMARY_TABLE).upsert(row).execute()
         logger.info("ensure_user_summary_updated: updated user_name=%s", u)
         return updated_summary
+    except GenerationCancelled:
+        raise
     except Exception as e:
         logger.warning("ensure_user_summary_updated failed user_name=%s err=%s", u, e)
         return existing_summary or None

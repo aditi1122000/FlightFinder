@@ -82,3 +82,47 @@ def persist_message(
     except Exception as e:
         logger.warning("Supabase persist_message failed: %s", e)
         return False
+
+
+SELECTION_TABLE = "flight_selections"
+
+
+def selection_row(conversation_id: str, flight: dict, passengers: dict, booking_airport: str, deep_link: str) -> dict:
+    """What we keep about a chosen flight. Counts only: traveller names never leave the session."""
+    return {
+        "conversation_id": conversation_id,
+        "provider": flight.get("provider") or "booking_com",
+        "airline": flight.get("airline"),
+        "flight_number": flight.get("flight_number"),
+        "origin_code": flight.get("origin_code"),
+        "destination_code": flight.get("destination_code"),
+        "booking_destination_code": booking_airport or flight.get("destination_code"),
+        "departure_date": flight.get("departure_date") or None,
+        "departure_at": flight.get("departure_at") or None,
+        "arrival_at": flight.get("arrival_at") or None,
+        "cabin_class": flight.get("cabin_class"),
+        "fare_name": flight.get("fare_name") or None,
+        "price": flight.get("price"),
+        "list_price": flight.get("list_price") or None,
+        "discount": flight.get("discount") or None,
+        "currency": "INR",
+        "stops": flight.get("stops"),
+        "duration_minutes": flight.get("duration_minutes") or None,
+        "adults": int(passengers.get("adults") or 1),
+        "children": int(passengers.get("children") or 0),
+        "infants": int(passengers.get("infants") or 0),
+        "offer_token": flight.get("offer_token") or None,
+        "deep_link": deep_link,
+    }
+
+
+def persist_flight_selection(row: dict) -> bool:
+    client = _get_client()
+    if client is None:
+        return False
+    try:
+        client.table(SELECTION_TABLE).insert(row).execute()
+        return True
+    except Exception as e:
+        logger.warning("Supabase persist_flight_selection failed: %s", e)
+        return False

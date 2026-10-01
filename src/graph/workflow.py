@@ -29,6 +29,10 @@ from src.services.flight_services import (
     format_flight_price,
     format_price_range,
     resolve_airport_code,
+    apply_open_window_slot_policy,
+    apply_two_turn_policy,
+    score_offers,
+    describe_scored_fares,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,19 +104,29 @@ User: {state["user_message"]}"""
         if "slots" in json_data:
             state["slots"] = fill_slots_from_last_search(json_data["slots"], state.get("last_search_params"))
         state["missing_slots"] = json_data.get("missing_slots", [])
+        apply_open_window_slot_policy(state)
+        apply_two_turn_policy(state)
     else:
-        state["status"] = "error"
-        state["error_message"] = "Failed to parse LLM response"
-        logger.warning(
-            "parse_llm: no JSON, status=error. Snippet: %s...",
-            (raw_reply or "")[:500].replace("\n", " "),
-        )
-        logger.info("parse_llm: appending format_error to chat_history")
-        # Strict format: only accept valid JSON; show short error, do not use unparsed text
-        state["chat_history"].append({
-            "role": "assistant",
-            "content": ERROR_MESSAGES.get("format_error", "I couldn't process that. Please try again."),
-        })
+        friendly = (conversational_msg or "").strip()
+        if friendly and friendly != "I understand. Let me help you with that.":
+            state["status"] = "clarification_needed"
+            state["missing_slots"] = state.get("missing_slots") or []
+            logger.warning(
+                "parse_llm: JSON unreadable, keeping the conversational line. Snippet: %s...",
+                (raw_reply or "")[:500].replace("\n", " "),
+            )
+        else:
+            state["status"] = "error"
+            state["error_message"] = "Failed to parse LLM response"
+            logger.warning(
+                "parse_llm: no JSON, status=error. Snippet: %s...",
+                (raw_reply or "")[:500].replace("\n", " "),
+            )
+            logger.info("parse_llm: appending format_error to chat_history")
+            state["chat_history"].append({
+                "role": "assistant",
+                "content": ERROR_MESSAGES.get("format_error", "I couldn't process that. Please try again."),
+            })
 
     return state
 
@@ -162,7 +176,7 @@ def handle_ready_for_search(state: FlightState) -> FlightState:
         state["chat_history"].append({"role": "assistant", "content": state["conversational_message"]})
         return state
 
-    flights, api_error, api_error_details = search_flights_api(slots_dict, max_results=10)
+    flights, api_error, api_error_details = search_flights_api(slots_dict, max_results=30)
     logger.info(
         "handle_ready_for_search: search returned flights=%d api_error=%s",
         len(flights) if flights else 0,
@@ -181,44 +195,28 @@ def handle_ready_for_search(state: FlightState) -> FlightState:
     if not combined_msg.endswith("\n"):
         combined_msg += "\n\n"
 
+    provider_down = (api_error_details or {}).get("reason") in ("provider_quota", "provider_unconfigured")
     if api_error:
-        combined_msg += f"⚠️ {api_error}\n\n"
+        combined_msg += f"{api_error}\n\n"
         state["error_context"] = api_error_details
-        suggestions = suggest_alternatives(slots_dict)
+        suggestions = {"suggestion_message": ""} if provider_down else suggest_alternatives(slots_dict)
         if suggestions["suggestion_message"]:
-            combined_msg += f"{suggestions['suggestion_message']}\n\nWould you like to try any of these alternatives?"
+            combined_msg += f"{suggestions['suggestion_message']}\n\nAny of those work?"
             state["suggested_alternatives"] = suggestions
     elif not flights:
-        combined_msg += "I couldn't find any flights matching your exact criteria.\n\n"
+        combined_msg += "Nothing came back for that exact day.\n\n"
         suggestions = suggest_alternatives(slots_dict)
         if suggestions["suggestion_message"]:
-            combined_msg += f"{suggestions['suggestion_message']}\n\nWould you like to try any of these alternatives?"
+            combined_msg += f"{suggestions['suggestion_message']}\n\nAny of those work?"
             state["suggested_alternatives"] = suggestions
     else:
-        combined_msg += "**Flight Search Results:**\n\n"
-        if state["price_stats"]:
-            combined_msg += f"*{format_price_range(state['price_stats'])}*\n\n"
-        for i, f in enumerate(flights[:10], 1):
-            f_dict = f if isinstance(f, dict) else (getattr(f, "dict", lambda: f)() if callable(getattr(f, "dict", None)) else f)
-            if not isinstance(f_dict, dict):
-                f_dict = {"airline": "?", "departure_time": "?", "arrival_time": "?", "price": None, "non_stop": True, "source_url": "#", "flight_number": None}
-            fn = f_dict.get("flight_number")
-            airline_display = f"{f_dict['airline']} ({fn})" if fn else f_dict["airline"]
-            date_display = format_departure_date_display(f_dict.get("departure_date") or slots_dict.get("departure_date"))
-            if date_display:
-                airline_display = f"{airline_display} — {date_display}"
-            route = ""
-            if f_dict.get("origin_code") and f_dict.get("destination_code"):
-                route = f"   {f_dict['origin_code']} → {f_dict['destination_code']}\n"
-            combined_msg += f"**{i}. {airline_display}** — {format_flight_price(f_dict.get('price'))}\n"
-            if route:
-                combined_msg += route
-            combined_msg += f"   Departure: {f_dict['departure_time']} | Arrival: {f_dict['arrival_time']}\n"
-            combined_msg += f"   {'Non-stop' if f_dict.get('non_stop') else 'With stops'}\n"
-            if f_dict.get("source_url") and f_dict["source_url"] != "#":
-                combined_msg += f"   [Book here]({f_dict['source_url']})\n"
-            combined_msg += "\n"
-        combined_msg += "\n*Data source: Real flight API*"
+        # The cards below the chat carry the detail. The bubble stays to one human line.
+        priced = score_offers(
+            [f for f in state["last_search_results"] if (f.get("price") or 0) > 0],
+            state.get("user_message") or "",
+        )
+        state["last_search_results"] = priced or state["last_search_results"]
+        combined_msg = describe_scored_fares(priced, slots_dict)
 
     state["conversational_message"] = combined_msg
     state["chat_history"].append({"role": "assistant", "content": combined_msg})
@@ -256,7 +254,7 @@ def handle_refining_search(state: FlightState) -> FlightState:
                 threshold = price_stats["min_price"] + (price_stats["avg_price"] - price_stats["min_price"]) * 0.3
             filtered = [f for f in state["last_search_results"] if f.get("price", 0) <= threshold]
             search_slots = {**slots_dict, "preferences": {**(slots_dict.get("preferences") or {}), "max_price": threshold}}
-            new_flights, _, _ = search_flights_api(search_slots, max_results=10)
+            new_flights, _, _ = search_flights_api(search_slots, max_results=30)
             all_flights = filtered + new_flights
             seen = set()
             for f in all_flights:
@@ -303,28 +301,17 @@ def handle_refining_search(state: FlightState) -> FlightState:
     if not combined_msg.endswith("\n"):
         combined_msg += "\n\n"
     if refined_flights:
-        combined_msg += f"**{refinement_msg}:**\n\n"
         stats = calculate_price_stats(refined_flights)
         if stats:
             state["price_stats"] = stats
-            combined_msg += f"*{format_price_range(stats)}*\n\n"
-        for i, f in enumerate(refined_flights[:10], 1):
-            fn = f.get("flight_number")
-            airline_display = f"{f['airline']} ({fn})" if fn else f["airline"]
-            date_display = format_departure_date_display(f.get("departure_date") or slots_dict.get("departure_date"))
-            if date_display:
-                airline_display = f"{airline_display} — {date_display}"
-            route = f"   {f['origin_code']} → {f['destination_code']}\n" if f.get("origin_code") and f.get("destination_code") else ""
-            combined_msg += f"**{i}. {airline_display}** — {format_flight_price(f.get('price'))}\n"
-            if route:
-                combined_msg += route
-            combined_msg += f"   Departure: {f['departure_time']} | Arrival: {f['arrival_time']}\n"
-            combined_msg += f"   {'Non-stop' if f.get('non_stop') else 'With stops'}\n"
-            if f.get("source_url") and f["source_url"] != "#":
-                combined_msg += f"   [Book here]({f['source_url']})\n"
-            combined_msg += "\n"
+        cheapest = min(refined_flights, key=lambda f: f.get("price") or 0)
+        combined_msg += (
+            f"{refinement_msg}. "
+            f"Lowest is {cheapest.get('airline') or 'one'} at {format_flight_price(cheapest.get('price'))}. "
+            "The picks are just below."
+        )
     else:
-        combined_msg += "I couldn't find any refined options. Would you like to try different criteria?"
+        combined_msg += "Nothing closer turned up with that filter. Loosen it a little and I'll look again."
 
     state["conversational_message"] = combined_msg
     state["chat_history"].append({"role": "assistant", "content": combined_msg})
@@ -353,10 +340,10 @@ def handle_awaiting_confirmation(state: FlightState) -> FlightState:
                 combined_msg += f" - {sug['distance_km']}km away"
             combined_msg += f"\n   {sug.get('reason', '')}\n"
         state["suggested_alternatives"] = {"airports": suggestions}
-    if state.get("error_context"):
-        combined_msg += "\n\nI encountered an issue with your request. "
-        if isinstance(state["error_context"], dict):
-            combined_msg += f"Please check: {', '.join(state['error_context'].keys())}"
+    if state.get("error_context") and isinstance(state["error_context"], dict):
+        fields = [k.replace("_", " ") for k in state["error_context"].keys()]
+        if fields:
+            combined_msg += f"\n\nOne thing to look at again: {', '.join(fields)}."
 
     state["conversational_message"] = combined_msg
     state["chat_history"].append({"role": "assistant", "content": combined_msg})

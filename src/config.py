@@ -17,6 +17,8 @@ AIRPORT_API_KEY = os.getenv("AIRPORT_API_KEY")
 AIRPORT_API_BASE_URL = os.getenv("AIRPORT_API_BASE_URL", "https://api.aviationstack.com/v1")
 RAPIDAPI_KEY = os.getenv("RapidAPI") or os.getenv("RAPIDAPI_KEY")
 RAPIDAPI_HOST = os.getenv("RapidAPIHost") or os.getenv("RAPIDAPI_HOST")
+# Maps JavaScript API. Separate from GEMINI_API_KEY / GOOGLE_API_KEY.
+GOOGLE_MAPS_API_KEY = (os.getenv("GOOGLE_MAPS_API_KEY") or "").strip()
 
 
 # LLM and app constants
@@ -45,6 +47,12 @@ RATE_LIMIT_WAIT_SECONDS = 2.5
 RATE_LIMIT_COOLDOWN_SECONDS = 90
 # Intent profiling (user summary) — safe again on Gemini; was off during Mistral 429s
 ENABLE_USER_SUMMARY_UPDATE = True
+# Comma-separated name fragments allowed to open Debug (e.g. "aditi")
+GARUDAX_DEBUG_USERS = {
+    n.strip().lower()
+    for n in (os.getenv("GARUDAX_DEBUG_USERS") or "").split(",")
+    if n.strip()
+}
 
 
 # Default booking slots (empty state)
@@ -107,11 +115,12 @@ Here's the comparison.
 </misc>
 
 CONVERSATIONAL MESSAGE RULES:
-- Keep it COMPRESSED and ON POINT. 1–3 short sentences max for normal replies.
-- When you also return <json_data>, keep the conversational message to one short line so the JSON is not truncated.
-- No long intros, no repetition of the user's words, no filler. We store these; they must be brief.
-- For clarifications: ask only what’s missing (e.g. "I need a specific departure date—pick any day in November 2026" or "Which city: Hanoi (HAN) or Ho Chi Minh (SGN)?"). Always name the missing item(s); never say only "I need more information."
-- For confirmations: one line (e.g. "Got it. From HYD to DEL on 2025-12-23. Searching.").
+- Sound like a calm person at a travel desk: warm, plain, and specific. Professional, never bossy or robotic.
+- 1–2 short sentences. No "as an AI", no "rate-limited", no "please don't", no "you must".
+- When you also return <json_data>, keep the conversational message to one or two short lines so the JSON is not truncated.
+- No long intros and no recap of every word they already said.
+- For clarifications: ask only what’s missing, in a natural way (e.g. "Hanoi or Ho Chi Minh?"). Do not ask for a specific day when they already gave a month/week or said any date — the chart handles that. Always name the missing item; never say only "I need more information."
+- For confirmations: one easy line (e.g. "Delhi to Vietnam in November. I’ll look that up.").
 - Do not list full slot recaps in the message; the system shows booking details separately.
 - Only when suggesting alternatives (e.g. airport codes) use 2–3 short bullet points if needed; otherwise stay minimal.
 
@@ -122,7 +131,8 @@ JSON RULES (always required):
 - "missing_slots" must be an array of missing slot keys (e.g. ["departure_date"]).
 
 STATUS MEANINGS:
-- clarification_needed: origin, destination, or departure_date missing
+- clarification_needed: origin or destination missing, or departure_date missing when the user did NOT name a month/week or say "any date"
+- When the user names a month or week ("next month", "November", "next week") or says any date / flexible / no preference on the day: leave departure_date null, do NOT put departure_date in missing_slots, use status "update", and say you will show fares across those days
 - update: slots updated but not yet ready to search; also use for special requests (table, summary, etc.) so no new search runs
 - ready_for_search: origin, destination, departure_date present
 - refining_search: user wants cheaper / nearby airports / flexible dates. If the user only asks for cheaper/budget/affordable (no mention of "flexible dates" or "other dates"), set preferences.flexible_dates to false and keep departure_date from Current booking state so the system filters by price on the same date.
@@ -148,29 +158,34 @@ SESSION / LAST MESSAGES:
 
 # Human-readable labels for missing slots (so we can say what's missing)
 MISSING_SLOT_LABELS = {
-    "origin": "Departure city or airport (e.g. Hyderabad / HYD)",
-    "destination": "Arrival city or airport (e.g. Hanoi / HAN)",
-    "departure_date": "A specific departure date (e.g. 12 Nov 2026)—pick any day if you're flexible",
-    "return_date": "Return date (or confirm one-way)",
-    "passengers": "Number of passengers (at least 1 adult)",
+    "origin": "where you're leaving from",
+    "destination": "where you're headed",
+    "departure_date": "a day to leave (any day that month is fine)",
+    "return_date": "a return day, or say one-way",
+    "passengers": "how many are travelling",
 }
 
 
 # User-facing error messages
 
 ERROR_MESSAGES = {
-    "network_error": "I'm having trouble connecting to the flight search service. Please try again in a moment.",
-    "api_error_4xx": "I couldn't process your request. Please check your search details and try again.",
-    "api_error_5xx": "The flight search service is temporarily unavailable. Please try again later.",
-    "timeout": "The request took too long. Please try again.",
-    "invalid_response": "I received an unexpected response. Please try again.",
-    "no_flights": "I couldn't find any flights matching your criteria.",
-    "invalid_airport": "I couldn't find that airport. Please check the airport code or city name.",
-    "invalid_date": "Please provide a valid date in the future.",
-    "missing_info": "I need more information to search for flights.",
-    "format_error": "I couldn't process that. Please try again.",
+    "network_error": "The fare search didn't answer just now. Give it a moment and try again.",
+    "api_error_4xx": "The fare search turned that one down. Check the cities and the date, then try again.",
+    "api_error_5xx": "The fare search is having a slow moment. Try again in a bit.",
+    "timeout": "That search took too long to come back. Once more should do it.",
+    "invalid_response": "The fare search sent back something odd. Try that again.",
+    "no_flights": "Nothing came back for that exact day.",
+    "provider_quota": (
+        "Live fares are paused. The fare provider's monthly allowance is used up, "
+        "so I won't show guessed prices."
+    ),
+    "provider_unconfigured": "Live fares aren't connected yet, so there's nothing real to show.",
+    "invalid_airport": "I couldn't place that airport. A city name works too.",
+    "invalid_date": "That date has passed. Pick a day ahead and I'll look.",
+    "missing_info": "A place and a day, and I can look.",
+    "format_error": "I lost the thread on that one. Say it once more.",
     "rate_limit": (
-        "I'm temporarily rate-limited by the AI provider. "
-        "Please wait **1–2 minutes**, then send **one** short message — don't retry quickly."
+        "The search desk is busy for a moment. "
+        "Give it a minute or two, then try that once more."
     ),
 }
