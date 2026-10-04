@@ -126,3 +126,185 @@ def persist_flight_selection(row: dict) -> bool:
     except Exception as e:
         logger.warning("Supabase persist_flight_selection failed: %s", e)
         return False
+
+
+# Offers ---------------------------------------------------------------------
+
+FARE_DISCOUNTS_TABLE = "fare_discounts"
+CARD_OFFERS_TABLE = "card_offers"
+REFRESH_RUNS_TABLE = "offer_refresh_runs"
+
+
+def upsert_fare_discounts(rows: list) -> int:
+    """Discounts already inside fares. Same row twice in a day is one row."""
+    client = _get_client()
+    if client is None or not rows:
+        return 0
+    seen, unique = set(), []
+    for r in rows:
+        r = {**r, "flight_number": r.get("flight_number") or "", "offer_token": r.get("offer_token") or ""}
+        key = (r["provider"], r["origin"], r["destination"], r["depart_date"], r["cabin_class"], r["flight_number"], r["offer_token"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(r)
+    try:
+        client.table(FARE_DISCOUNTS_TABLE).upsert(
+            unique,
+            on_conflict="provider,origin,destination,depart_date,cabin_class,flight_number,offer_token",
+        ).execute()
+        return len(unique)
+    except Exception as e:
+        logger.warning("Supabase upsert_fare_discounts failed: %s", e)
+        return 0
+
+
+def upsert_card_offers(rows: list) -> int:
+    client = _get_client()
+    if client is None or not rows:
+        return 0
+    clean = []
+    for r in rows:
+        r = dict(r)
+        for key in ("valid_from", "valid_until"):
+            v = r.get(key)
+            if hasattr(v, "isoformat"):
+                r[key] = v.isoformat()
+        r["code"] = r.get("code") or ""
+        r.setdefault("site", "unknown")
+        r.setdefault("segment", "any")
+        r.setdefault("eligible_cards", [])
+        r.setdefault("excluded_cards", [])
+        r.setdefault("airline", None)
+        r.setdefault("active", True)
+        clean.append(r)
+    # Postgres refuses a batch that hits the same unique key twice; keep the first of each.
+    seen, unique = set(), []
+    for r in clean:
+        key = (r["site"], r["bank"], r["merchant"], r["segment"], r["code"], r["title"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(r)
+    try:
+        client.table(CARD_OFFERS_TABLE).upsert(
+            unique, on_conflict="site,bank,merchant,segment,code,title"
+        ).execute()
+        return len(unique)
+    except Exception as e:
+        logger.warning("Supabase upsert_card_offers failed: %s", e)
+        return 0
+
+
+CREDIT_CARDS_TABLE = "credit_cards"
+
+
+def upsert_credit_cards(rows: list) -> int:
+    client = _get_client()
+    if client is None or not rows:
+        return 0
+    try:
+        client.table(CREDIT_CARDS_TABLE).upsert(
+            [{**r, "active": True} for r in rows], on_conflict="bank,card_name"
+        ).execute()
+        return len(rows)
+    except Exception as e:
+        logger.warning("Supabase upsert_credit_cards failed: %s", e)
+        return 0
+
+
+ROUTE_WATCH_TABLE = "route_watch"
+
+
+def insert_route_watch(rows: list) -> int:
+    client = _get_client()
+    if client is None or not rows:
+        return 0
+    try:
+        client.table(ROUTE_WATCH_TABLE).insert(rows).execute()
+        return len(rows)
+    except Exception as e:
+        logger.warning("Supabase insert_route_watch failed: %s", e)
+        return 0
+
+
+def load_latest_route_watch() -> list:
+    """Most recent row per watched route."""
+    client = _get_client()
+    if client is None:
+        return []
+    try:
+        res = (
+            client.table(ROUTE_WATCH_TABLE)
+            .select("*")
+            .order("fetched_at", desc=True)
+            .limit(60)
+            .execute()
+        )
+        latest = {}
+        for r in res.data or []:
+            latest.setdefault((r["origin"], r["destination"]), r)
+        return list(latest.values())
+    except Exception as e:
+        logger.warning("Supabase load_latest_route_watch failed: %s", e)
+        return []
+
+
+def load_credit_cards() -> list:
+    client = _get_client()
+    if client is None:
+        return []
+    try:
+        res = (
+            client.table(CREDIT_CARDS_TABLE)
+            .select("card_name,bank,co_brand,co_brand_kind,tier,annual_fee,lounge_access,highlights,pitch,listing_url,terms_url,rating,pros,cons")
+            .eq("active", True)
+            .order("bank")
+            .execute()
+        )
+        return list(res.data or [])
+    except Exception as e:
+        logger.warning("Supabase load_credit_cards failed: %s", e)
+        return []
+
+
+def load_card_offers() -> list:
+    client = _get_client()
+    if client is None:
+        return []
+    try:
+        res = client.table(CARD_OFFERS_TABLE).select("*").eq("active", True).execute()
+        return list(res.data or [])
+    except Exception as e:
+        logger.warning("Supabase load_card_offers failed: %s", e)
+        return []
+
+
+def expire_offers() -> None:
+    client = _get_client()
+    if client is None:
+        return
+    try:
+        client.rpc("expire_card_offers").execute()
+    except Exception as e:
+        logger.warning("Supabase expire_card_offers failed: %s", e)
+
+
+def record_refresh_run(fare_rows: int, card_rows: int, ok: list, failed: list, note: str = "",
+                       catalog_rows: int = 0) -> None:
+    client = _get_client()
+    if client is None:
+        return
+    try:
+        from datetime import datetime, timezone
+        client.table(REFRESH_RUNS_TABLE).insert({
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "fare_rows": fare_rows,
+            "card_rows": card_rows,
+            "catalog_rows": catalog_rows,
+            "sources_ok": ok,
+            "sources_failed": failed,
+            "note": note or None,
+        }).execute()
+    except Exception as e:
+        logger.warning("Supabase record_refresh_run failed: %s", e)

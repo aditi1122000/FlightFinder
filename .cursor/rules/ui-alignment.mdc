@@ -1,0 +1,17 @@
+---
+description: Align UI without being asked. Prices first, then card offers, then travel cards.
+alwaysApply: true
+---
+
+# UI alignment and order
+
+Fix alignment as part of the change. Do not wait to be asked, and do not mention alignment as a task.
+
+- One control for one job. Do not put a button that repeats a table, sort, or list below it.
+- Prices with any listed discount come first. Card offers on this search come next. Travel cards a person could apply for come last.
+- Map and mood photo sit at the very end of the results, after the decisions.
+- Rows share one grid: name left, amount right, meta on the line below. Same padding, same baseline.
+- Name the site that honours an offer (Goibibo, MakeMyTrip, Cleartrip). Fares come from Booking.com; card codes do not apply there.
+- Every card and offer row has a check/terms link.
+- A primary action is enabled as soon as the values the destination site can accept are present. Do not gate Booking.com on names it cannot receive.
+- Before calling a dialog or form done, type, clear, and change a number input and confirm the button state follows the values on screen.

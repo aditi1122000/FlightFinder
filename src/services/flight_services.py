@@ -17,7 +17,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import urllib3.connection as _u3conn
 
@@ -932,11 +932,11 @@ def _normalize_booking_flight_offer(offer: dict) -> dict:
         arr_str = _parse_iso_time(arr_iso) if arr_iso else "00:00"
         airline_name = "Unknown"
         flight_number_str = None
+        carrier_code = ""
         legs = seg.get("legs") or []
         if legs:
             leg0 = legs[0]
             carriers_data = leg0.get("carriersData") or []
-            carrier_code = ""
             if carriers_data and isinstance(carriers_data[0], dict):
                 airline_name = carriers_data[0].get("name") or airline_name
                 carrier_code = carriers_data[0].get("code") or ""
@@ -981,8 +981,10 @@ def _normalize_booking_flight_offer(offer: dict) -> dict:
                 pass
         token = offer.get("token") or ""
         fare_name = (offer.get("brandedFareInfo") or {}).get("fareName") or ""
+        carrier_out = carrier_code or carrier_code_from_flight({"flight_number": flight_number_str})
         return {
             "airline": airline_name,
+            "carrier_code": carrier_out or None,
             "departure_time": dep_str,
             "arrival_time": arr_str,
             "price": round(price, 2),
@@ -1025,7 +1027,52 @@ def passenger_ages(passengers: Optional[Dict]) -> List[int]:
     return ages + [0] * infants
 
 
-def build_booking_search_url(origin_code: str, dest_code: str, slots: Dict) -> str:
+def carrier_code_from_flight(flight: Optional[Dict]) -> str:
+    """IATA carrier prefix from a normalized flight row (e.g. 6E from '6E 5121')."""
+    flight = flight if isinstance(flight, dict) else {}
+    raw = str(flight.get("carrier_code") or "").strip().upper()
+    if raw:
+        return raw
+    number = str(flight.get("flight_number") or "").strip().upper()
+    if not number:
+        return ""
+    m = re.match(r"^([A-Z0-9]{2})\s", number)
+    if m:
+        return m.group(1)
+    m = re.match(r"^([A-Z0-9]{2})\d", number.replace(" ", ""))
+    return m.group(1) if m else ""
+
+
+def route_codes_from_flight(flight: Dict, slots: Optional[Dict] = None) -> Tuple[str, str]:
+    """Origin and destination IATA codes from the fare row, falling back to search slots."""
+    slots = slots if isinstance(slots, dict) else {}
+    origin = str(flight.get("origin_code") or "").upper()
+    dest = str(flight.get("destination_code") or "").upper()
+    if not origin:
+        origin = str(((slots.get("origin") or {}).get("airport_code")) or "").upper()
+    if not dest:
+        dest = str(((slots.get("destination") or {}).get("airport_code")) or "").upper()
+    return origin, dest
+
+
+def booking_slots_for_flight(flight: Dict, slots: Dict, dest_code: str) -> Dict:
+    """Merge the chosen fare and traveller counts into one slot bag for URL builders."""
+    slots = dict(slots or {})
+    origin, _ = route_codes_from_flight(flight, slots)
+    dest = str(dest_code or "").upper() or route_codes_from_flight(flight, slots)[1]
+    departure = _to_str(flight.get("departure_date")) or _to_str(slots.get("departure_date")) or ""
+    cabin = _to_str(flight.get("cabin_class")) or _to_str(slots.get("cabin_class")) or "economy"
+    return {
+        **slots,
+        "passengers": dict(slots.get("passengers") or {}),
+        "departure_date": departure,
+        "cabin_class": cabin,
+        "_origin_code": origin,
+        "_dest_code": dest,
+    }
+
+
+def build_booking_search_url(origin_code: str, dest_code: str, slots: Dict, flight: Optional[Dict] = None) -> str:
     """Booking.com route search with the details their public web flow accepts."""
     passengers = slots.get("passengers") or {}
     departure = _to_str(slots.get("departure_date")) or ""
@@ -1046,8 +1093,144 @@ def build_booking_search_url(origin_code: str, dest_code: str, slots: Dict) -> s
         params["childrenAges"] = ",".join(str(a) for a in ages)
     if return_date:
         params["return"] = return_date
+    carrier = carrier_code_from_flight(flight)
+    if carrier:
+        params["airlines"] = carrier
     route = f"{origin_code}.AIRPORT-{dest_code}.AIRPORT"
     return f"https://flights.booking.com/flights/{route}/?{urlencode(params)}"
+
+
+def build_booking_url_for_flight(flight: Dict, slots: Dict, dest_code: str) -> str:
+    merged = booking_slots_for_flight(flight, slots, dest_code)
+    origin = merged.get("_origin_code") or ""
+    dest = merged.get("_dest_code") or dest_code
+    if not origin or not dest:
+        return ""
+    return build_booking_search_url(origin, dest, merged, flight=flight)
+
+
+def _append_query(url: str, extra: Dict[str, str]) -> str:
+    if not url or url == "#" or not extra:
+        return url
+    parsed = urlparse(url)
+    q = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    for k, v in extra.items():
+        if v:
+            q[k] = v
+    return urlunparse(parsed._replace(query=urlencode(q)))
+
+
+def ota_search_url_for_offer(
+    offer: Optional[Dict],
+    origin_code: str,
+    dest_code: str,
+    slots: Dict,
+    flight: Optional[Dict] = None,
+) -> str:
+    """Route search on the site that honours the offer, with coupon when we have one."""
+    offer = offer if isinstance(offer, dict) else {}
+    base = ota_search_url(offer.get("merchant") or offer.get("site") or "", origin_code, dest_code, slots)
+    merchant = (offer.get("merchant") or offer.get("site") or "").lower()
+    code = str(offer.get("code") or "").strip()
+    extra: Dict[str, str] = {}
+    if code and "cleartrip" in merchant:
+        extra["coupon"] = code
+    elif code and "makemytrip" in merchant:
+        extra["coupon"] = code
+    elif code and "goibibo" in merchant:
+        extra["cpnCode"] = code
+    elif code and "ixigo" in merchant:
+        extra["couponCode"] = code
+    carrier = carrier_code_from_flight(flight)
+    if carrier and "cleartrip" in merchant:
+        extra["airline"] = carrier
+    return _append_query(base, extra)
+
+
+def _cabin_letter(slots: Dict) -> str:
+    cabin = (_to_str(slots.get("cabin_class")) or "economy").lower()
+    return "B" if "business" in cabin else "E"
+
+
+def _pax_counts(slots: Dict) -> Tuple[int, int, int]:
+    passengers = slots.get("passengers") or {}
+    return (
+        max(1, int(passengers.get("adults") or 1)),
+        max(0, int(passengers.get("children") or 0)),
+        max(0, int(passengers.get("infants") or 0)),
+    )
+
+
+def build_goibibo_search_url(origin_code: str, dest_code: str, slots: Dict) -> str:
+    departure = (_to_str(slots.get("departure_date")) or "").replace("-", "")
+    adults, children, infants = _pax_counts(slots)
+    from src.services.offers import route_segment
+    leg = "I" if route_segment(origin_code, dest_code) == "international" else "D"
+    return (
+        f"https://www.goibibo.com/flights/air-{origin_code}-{dest_code}-{departure}"
+        f"--{adults}-{children}-{infants}-{_cabin_letter(slots)}-{leg}/"
+    )
+
+
+def build_mmt_search_url(origin_code: str, dest_code: str, slots: Dict) -> str:
+    raw = _to_str(slots.get("departure_date")) or ""
+    try:
+        day = datetime.strptime(raw, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        day = raw
+    adults, children, infants = _pax_counts(slots)
+    from src.services.offers import route_segment
+    intl = "false" if route_segment(origin_code, dest_code) == "domestic" else "true"
+    return (
+        f"https://www.makemytrip.com/flight/search?itinerary={origin_code}-{dest_code}-{day}"
+        f"&tripType=O&paxType=A-{adults}_C-{children}_I-{infants}"
+        f"&intl={intl}&cabinClass={_cabin_letter(slots)}&ccde=IN&lang=eng"
+    )
+
+
+def build_cleartrip_search_url(origin_code: str, dest_code: str, slots: Dict) -> str:
+    raw = _to_str(slots.get("departure_date")) or ""
+    try:
+        day = datetime.strptime(raw, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        day = raw
+    adults, children, infants = _pax_counts(slots)
+    cabin = "Business" if _cabin_letter(slots) == "B" else "Economy"
+    from src.services.offers import route_segment
+    intl = "n" if route_segment(origin_code, dest_code) == "domestic" else "y"
+    return (
+        f"https://www.cleartrip.com/flights/results?from={origin_code}&to={dest_code}"
+        f"&depart_date={day}&adults={adults}&childs={children}&infants={infants}"
+        f"&class={cabin}&intl={intl}"
+    )
+
+
+def build_ixigo_search_url(origin_code: str, dest_code: str, slots: Dict) -> str:
+    raw = _to_str(slots.get("departure_date")) or ""
+    try:
+        day = datetime.strptime(raw, "%Y-%m-%d").strftime("%d%m%Y")
+    except ValueError:
+        day = raw.replace("-", "")
+    adults, children, infants = _pax_counts(slots)
+    return (
+        f"https://www.ixigo.com/search/result/flight?from={origin_code}&to={dest_code}"
+        f"&date={day}&adults={adults}&children={children}&infants={infants}"
+        f"&class={_cabin_letter(slots).lower()}"
+    )
+
+
+def ota_search_url(merchant: str, origin_code: str, dest_code: str, slots: Dict) -> str:
+    """Search URL on the site that actually honours the card offer."""
+    name = (merchant or "").lower()
+    if "cleartrip" in name:
+        return build_cleartrip_search_url(origin_code, dest_code, slots)
+    if "ixigo" in name:
+        return build_ixigo_search_url(origin_code, dest_code, slots)
+    if "makemytrip" in name:
+        return build_mmt_search_url(origin_code, dest_code, slots)
+    if any(k in name for k in ("goibibo", "paytm", "musafir")):
+        return build_goibibo_search_url(origin_code, dest_code, slots)
+    return build_booking_search_url(origin_code, dest_code, slots)
 
 
 FARE_CACHE_TTL_S = 600
@@ -1182,7 +1365,23 @@ def _provider_route(
         f["provider"] = provider
         f["source_url"] = link
     _cache_put(key, flights)
+    _record_fare_discounts_later(flights)
     return flights[:limit], None
+
+
+def _record_fare_discounts_later(flights: List[Dict]) -> None:
+    """Copy any discounts in this page into fare_discounts. Off the request path."""
+    def worker() -> None:
+        try:
+            from src.services.offers import fare_discount_rows
+            from src.services.supabase_persistence import upsert_fare_discounts
+            rows = fare_discount_rows(flights)
+            if rows:
+                upsert_fare_discounts(rows)
+        except Exception as exc:  # never let bookkeeping break a search
+            logger.debug("fare_discounts record skipped: %s", exc)
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def _search_flights_single_route(

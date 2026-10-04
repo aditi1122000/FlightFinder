@@ -85,13 +85,18 @@ from src.services.flight_services import (
     format_price_range,
     resolve_airport_code,
     explore_open_window,
-    build_booking_search_url,
+    build_booking_url_for_flight,
+    booking_slots_for_flight,
+    route_codes_from_flight,
+    ota_search_url_for_offer,
     sibling_airports,
     apply_open_window_slot_policy,
     should_explore_window,
     try_local_followup,
 )
 from src.services.summarisation import ensure_user_summary_updated, get_user_summary
+from src.services.offers import offers_for_fare, estimate_saving, route_segment, suggest_cards
+from src.services.supabase_persistence import load_card_offers, load_credit_cards
 from src.services.route_experience import (
     build_route_snapshot,
     leaflet_route_html,
@@ -269,7 +274,9 @@ def _job_worker(graph, initial_state: dict, user_name: str | None, box: dict) ->
         if local is not None:
             if local.get("fare_sort"):
                 box["fare_sort"] = local["fare_sort"]
-            box["result"] = {**initial_state, **local}
+            merged = {**initial_state, **local}
+            box["card_picks"] = _card_picks_for(merged)
+            box["result"] = merged
             logger.info("job: local follow-up, no new model or fare search")
             return
         if ENABLE_USER_SUMMARY_UPDATE and user_name and user_turns <= 1:
@@ -337,6 +344,7 @@ def _job_worker(graph, initial_state: dict, user_name: str | None, box: dict) ->
                     box["user_summary"] = summary
             except Exception:
                 pass
+        box["card_picks"] = _card_picks_for(result)
         box["result"] = result
         logger.info("job: graph done status=%s", status)
     except GenerationCancelled:
@@ -385,6 +393,8 @@ def _consume_job() -> None:
     result = job.get("result") or {}
     if result.get("fare_sort"):
         st.session_state.fare_sort = result["fare_sort"]
+    if job.get("card_picks"):
+        st.session_state.card_picks = job["card_picks"]
     err = job.get("error")
     if job.get("stopped") or _is_generation_cancelled(err):
         st.session_state.stopped_note = True
@@ -1697,7 +1707,7 @@ def _render_paths() -> bool:
         active = card.get("sort") == current if mode == "book" else i == 0
         with col:
             with st.container(key="pathactive" if active else f"path{i}"):
-                pick = ' <span class="gx-pick">Our pick</span>' if i == 0 else ""
+                pick = ' <span class="gx-path-badge">Our pick</span>' if i == 0 else ""
                 note = card.get("note") or ""
                 st.markdown(
                     f'<div class="gx-path"><div class="t">{html.escape(card["title"])}{pick}</div>'
@@ -1710,23 +1720,6 @@ def _render_paths() -> bool:
                 if mode == "pick":
                     if st.button(card["button"], key=f"path_go_{i}", use_container_width=True):
                         _queue_turn(card["ask"])
-                else:
-                    st.button(
-                        "Sorted below" if active else f"Show {card['sort'].lower()} first",
-                        key=f"path_sort_{i}",
-                        on_click=_set_fare_sort,
-                        args=(card["sort"],),
-                        disabled=active,
-                        width="stretch",
-                    )
-    if mode == "book":
-        cabin = str((flights[0] or {}).get("cabin_class") or "economy").replace("_", " ").title()
-        other = "Business" if cabin.lower() == "economy" else "Economy"
-        st.caption(f"Showing {cabin} fares. Premium-seat discounts appear when the provider returns them.")
-        if st.button(f"Compare {other} fares", key="compare_cabin"):
-            _queue_turn(
-                f"Show {other.lower()} class flights for the same route and date, including available discounts."
-            )
     return True
 
 
@@ -1747,6 +1740,24 @@ def _close_booking() -> None:
     st.session_state.booking_ready_url = None
 
 
+def _price_stack(flight: dict) -> str:
+    """Discount above the struck original, then the price you pay."""
+    pay = float(flight.get("price") or 0)
+    cut = float(flight.get("discount") or 0)
+    listed = float(flight.get("list_price") or 0)
+    if listed <= pay and cut > 0:
+        listed = pay + cut
+    if cut > 0 and listed > pay:
+        return (
+            '<span class="gx-price">'
+            f'<small>{html.escape(format_flight_price(cut))} off</small>'
+            f'<s>{html.escape(format_flight_price(listed))}</s>'
+            f'<b>{html.escape(format_flight_price(pay))}</b>'
+            "</span>"
+        )
+    return f'<span class="gx-price"><b>{html.escape(format_flight_price(pay))}</b></span>'
+
+
 def _ticket_html(flight: dict) -> str:
     airline = html.escape(str(flight.get("airline") or "Flight"))
     number = html.escape(str(flight.get("flight_number") or "").strip())
@@ -1759,7 +1770,7 @@ def _ticket_html(flight: dict) -> str:
         '<div class="gx-ticket">'
         f'<div class="top"><span class="who">{airline}'
         + (f' <em>{number}</em>' if number else "")
-        + f'</span><span class="fare">{html.escape(format_flight_price(flight.get("price")))}</span></div>'
+        + f'</span>{_price_stack(flight)}</div>'
         '<div class="leg">'
         f'<div><b>{html.escape(str(flight.get("departure_time") or ""))}</b>'
         f'<span>{html.escape(str(flight.get("origin_code") or ""))}</span></div>'
@@ -1772,15 +1783,260 @@ def _ticket_html(flight: dict) -> str:
     )
 
 
-@st.dialog("Book this flight", width="small", on_dismiss=_close_booking)
+@st.cache_data(ttl=8 * 3600, show_spinner=False)
+def _card_offers_cached() -> list:
+    """Card deals table. Refreshed by scripts/refresh_offers.py three times a day."""
+    try:
+        return load_card_offers()
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=8 * 3600, show_spinner=False)
+def _credit_cards_cached() -> list:
+    """Travel credit card catalogue. Refreshed with the offers."""
+    try:
+        return load_credit_cards()
+    except Exception:
+        return []
+
+
+def _aggregator_label(offer: dict) -> str:
+    site = (offer.get("site") or offer.get("merchant") or "").lower()
+    if "goibibo" in site:
+        return "Goibibo"
+    if "cleartrip" in site:
+        return "Cleartrip"
+    if "ixigo" in site:
+        return "ixigo"
+    if "axis" in site:
+        return offer.get("merchant") or "Axis"
+    return offer.get("merchant") or "the booking site"
+
+
+def _offer_amount(offer: dict, fare: float) -> str:
+    saving = estimate_saving(offer, fare) if fare else None
+    if saving:
+        return f"about ₹{saving:,.0f} off"
+    if offer.get("max_amount"):
+        return f"up to ₹{float(offer['max_amount']):,.0f} off"
+    if offer.get("percent_off"):
+        return f"up to {float(offer['percent_off']):g}%"
+    return ""
+
+
+FARE_COLS = [5.2, 2, 1.3]
+
+
+def _lead_site(offers: list) -> str:
+    """The booking site the card button will open. Fares stay on Booking.com."""
+    for offer in offers or []:
+        where = _aggregator_label(offer)
+        if where and where != "Booking.com":
+            return where
+    return ""
+
+
+def _offers_for_site(offers: list, site: str) -> list:
+    if not site:
+        return []
+    out, seen = [], set()
+    for offer in offers or []:
+        if _aggregator_label(offer) != site:
+            continue
+        key = (offer.get("code"), offer.get("bank"), _short_offer_title(offer.get("title") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(offer)
+    return out
+
+
+def _offer_html(
+    offer: dict,
+    fare: float = 0.0,
+    *,
+    trip_url: str = "",
+) -> str:
+    amount = _offer_amount(offer, fare)
+    code = str(offer.get("code") or "").strip()
+    where = _aggregator_label(offer)
+    title = _short_offer_title(offer.get("title") or "")
+    if code and code in title:
+        title = re.sub(rf"\s*[·\-–]?\s*{re.escape(code)}\s*", " ", title).strip(" ·-")
+    ref = offer.get("detail_url") or offer.get("terms_url") or ""
+    tags = []
+    if offer.get("card_kind") == "emi":
+        tags.append("EMI")
+    if offer.get("min_spend"):
+        tags.append(f"min ₹{float(offer['min_spend']):,.0f}")
+    links = []
+    if ref:
+        links.append(f'<a class="gx-ref" href="{html.escape(ref)}" target="_blank" rel="noopener">Terms</a>')
+    if trip_url and where != "Booking.com":
+        links.append(
+            f'<a class="gx-ref gx-ref-trip" href="{html.escape(trip_url)}" target="_blank" rel="noopener">'
+            f'{html.escape(where)}</a>'
+        )
+    name = offer.get("bank") or where
+    code_bit = f' · <b>{html.escape(code)}</b>' if code else ""
+    return (
+        f'<div class="gx-offer">'
+        f'<span class="gx-offer-bank">{html.escape(name)}{code_bit}</span>'
+        f'<span class="gx-offer-amt">{html.escape(amount)}</span>'
+        f'<span class="gx-offer-text">{html.escape(title)}</span>'
+        f'<span class="gx-offer-meta">'
+        + (html.escape(" · ".join(tags)) if tags else "")
+        + ((" · " if tags else "") + " · ".join(links) if links else "")
+        + "</span></div>"
+    )
+
+
+def _clip_text(text: str, limit: int = 140) -> str:
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if len(t) <= limit:
+        return t
+    return t[: limit - 1].rsplit(" ", 1)[0] + "…"
+
+
+def _render_card_offers(flight: dict) -> None:
+    """Deals that might cut this fare at payment. Listed, not promised."""
+    airline = str(flight.get("airline") or "")
+    try:
+        fare = float(flight.get("price") or 0)
+    except (TypeError, ValueError):
+        fare = 0.0
+    all_offers = _card_offers_cached()
+    if not all_offers:
+        return
+    cards = _credit_cards_cached()
+    chosen = None
+    base_slots = st.session_state.get("slots") or {}
+    origin_code, dest_code = route_codes_from_flight(flight, base_slots)
+    segment = route_segment(origin_code, dest_code)
+    book_slots = booking_slots_for_flight(flight, base_slots, dest_code)
+    bank = None
+
+    raw = offers_for_fare(
+        all_offers, airline, bank=None, fare=fare, segment=segment,
+    )
+    site = _lead_site(raw)
+    matches = _offers_for_site(raw, site)[:4]
+    fare_cut = float(flight.get("discount") or 0)
+    items = []
+    if fare_cut > 0:
+        items.append(
+            f'<div class="gx-offer"><span class="gx-offer-bank">In this fare</span>'
+            f'<span class="gx-offer-text">₹{fare_cut:,.0f} already taken off the list price</span>'
+            f'<span class="gx-offer-meta">no code needed</span></div>'
+        )
+    for o in matches:
+        trip_url = ota_search_url_for_offer(o, origin_code, dest_code, book_slots, flight=flight)
+        items.append(_offer_html(o, fare, trip_url=trip_url))
+    if chosen and chosen.get("co_brand") and chosen["co_brand"].lower() == airline.lower():
+        items.append(
+            f'<div class="gx-offer"><span class="gx-offer-bank">{html.escape(chosen["bank"])}</span>'
+            f'<span class="gx-offer-text">{html.escape(chosen["card_name"])} earns its {html.escape(airline)} rate on top</span>'
+            f'<span class="gx-offer-meta">co-branded card</span></div>'
+        )
+    if not items and chosen:
+        items.append(
+            f'<div class="gx-offer"><span class="gx-offer-bank">{html.escape(chosen["bank"])}</span>'
+            f'<span class="gx-offer-text">No listed offer on this fare right now</span></div>'
+        )
+    if items:
+        st.markdown(
+            f'<div class="gx-offers gx-coupons"><div class="gx-offers-h"><span class="gx-coupon-mark">%</span> Bank offers and coupons on {html.escape(site or "this fare")}</div>'
+            + "".join(items)
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+    # Section 2: cards the traveller doesn't hold that would cut this fare. Opt-in, not a pitch.
+    if cards:
+        _render_card_suggestions(cards, all_offers, airline, fare, exclude_bank=bank, segment=segment)
+
+
+def _short_offer_title(title: str) -> str:
+    """Scraped offer text can run long ('...; Min ATV – Rs. 7,500 + 3M NC EMI'). Keep the first clause."""
+    t = re.split(r"[;|]| — | - (?=[A-Z])", title or "", maxsplit=1)[0].strip()
+    t = re.sub(r"\s*\((?:on all|all) [^)]*\)", "", t)
+    return (t[:90] + "…") if len(t) > 92 else t
+
+
+def _render_card_suggestions(cards: list, all_offers: list, airline: str, fare: float,
+                             exclude_bank, segment: str = None, limit: int = 3) -> None:
+    from src.services.offers import bank_key, offers_by_bank
+    by_bank = offers_by_bank(all_offers)
+    ranked = []
+    for c in cards:
+        key = bank_key(c["bank"])
+        if exclude_bank and key == bank_key(exclude_bank):
+            continue
+        bank_deals = offers_for_fare(by_bank.get(key, []), airline, card_name=c["card_name"], fare=fare, segment=segment)
+        if not bank_deals:
+            continue
+        best = bank_deals[0]
+        saving = estimate_saving(best, fare) if fare else None
+        cobrand = 1 if (c.get("co_brand") or "").lower() == airline.lower() else 0
+        ranked.append((cobrand, saving or 0, -(float(c.get("annual_fee") or 0)), c, best, saving))
+    ranked.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
+    picks, seen_banks = [], set()
+    for t in ranked:  # one card per bank, so the list reads as choices rather than a catalogue
+        key = bank_key(t[3]["bank"])
+        if key in seen_banks:
+            continue
+        seen_banks.add(key)
+        picks.append(t)
+        if len(picks) >= limit:
+            break
+    if not picks:
+        return
+    rows = []
+    for _, _, _, c, best, saving in picks:
+        fee = c.get("annual_fee")
+        fee_txt = "no annual fee" if fee is not None and float(fee) == 0 else (f"₹{float(fee):,.0f}/yr" if fee is not None else "")
+        gain = f"about ₹{saving:,.0f} off" if saving else _offer_amount(best, fare)
+        listing = c.get("listing_url") or ""
+        terms = c.get("terms_url") or listing
+        offer_ref = best.get("detail_url") or ""
+        refs = []
+        if listing:
+            refs.append(f'<a class="gx-ref" href="{html.escape(listing)}" target="_blank" rel="noopener">Card</a>')
+        if terms and terms != listing:
+            refs.append(f'<a class="gx-ref" href="{html.escape(terms)}" target="_blank" rel="noopener">Bank terms</a>')
+        if offer_ref:
+            refs.append(f'<a class="gx-ref" href="{html.escape(offer_ref)}" target="_blank" rel="noopener">Offer</a>')
+        rows.append(
+            f'<div class="gx-card">'
+            f'<span class="gx-card-name">{html.escape(c["card_name"])}</span>'
+            f'<span class="gx-card-gain">{html.escape(gain)}</span>'
+            f'<span class="gx-card-meta">{html.escape(fee_txt)}'
+            + (" · lounge" if c.get("lounge_access") else "")
+            + (f' · apply on {_aggregator_label(best)}' if best else "")
+            + (f' · {" · ".join(refs)}' if refs else "")
+            + "</span></div>"
+        )
+    top = picks[0]
+    top_card, top_offer, top_saving = top[3], top[4], top[5]
+    gain = f"about ₹{top_saving:,.0f} off" if top_saving else _offer_amount(top_offer, fare)
+    with st.expander(
+        f"{top_card['card_name']} · {gain} on {_aggregator_label(top_offer)}",
+        expanded=False,
+    ):
+        st.markdown('<div class="gx-cards">' + "".join(rows) + "</div>", unsafe_allow_html=True)
+
+
+@st.dialog("Book this flight", width="medium", on_dismiss=_close_booking)
 def _passenger_dialog() -> None:
     """Asked only after a fare is chosen. One screen, one button."""
     flight = st.session_state.get("selected_flight") or {}
     if not flight:
         return
-    origin_code = str(flight.get("origin_code") or "")
-    dest_code = str(flight.get("destination_code") or "")
+    base_slots = st.session_state.get("slots") or {}
+    origin_code, dest_code = route_codes_from_flight(flight, base_slots)
     st.markdown(_ticket_html(flight), unsafe_allow_html=True)
+    _render_card_offers(flight)
 
     booking_dest = dest_code
     city, siblings = sibling_airports(dest_code)
@@ -1818,34 +2074,42 @@ def _passenger_dialog() -> None:
         + [f"Child {i + 1}" for i in range(int(children))]
         + [f"Infant {i + 1}" for i in range(int(infants))]
     )
+    def _touch_name() -> None:
+        return None
+
     with st.container(key="paxnames"):
         names = [
             st.text_input(
                 label,
-                placeholder=f"{label} · full name as on passport",
+                placeholder=label,
                 key=f"traveller_name_{i}",
                 label_visibility="collapsed",
+                autocomplete="off",
+                on_change=_touch_name,
             ).strip()
             for i, label in enumerate(labels)
         ]
     lap_ok = int(infants) <= int(adults)
+    filled = [n.casefold() for n in names if n]
+    names_ok = len(filled) == len(set(filled))
     if not lap_ok:
         st.caption("Each infant needs an adult lap, so add an adult or remove an infant.")
-    ready = bool(origin_code and booking_dest) and all(names) and lap_ok
+    elif not names_ok:
+        st.caption("Each traveller needs a different name.")
 
     passengers = {"adults": int(adults), "children": int(children), "infants": int(infants)}
-    slots = {
-        **(st.session_state.get("slots") or {}),
-        "passengers": passengers,
-        "cabin_class": str(flight.get("cabin_class") or "economy"),
-        "departure_date": flight.get("departure_date") or (st.session_state.get("slots") or {}).get("departure_date"),
-    }
-    url = build_booking_search_url(origin_code, booking_dest, slots) if origin_code and booking_dest else ""
+    slots = booking_slots_for_flight(
+        flight,
+        {**base_slots, "passengers": passengers},
+        booking_dest,
+    )
+    ready = bool(origin_code and booking_dest and slots.get("departure_date") and lap_ok and names_ok)
+    url = build_booking_url_for_flight(flight, slots, booking_dest) if ready else ""
 
-    if ready:
-        st.session_state.slots = slots
-        st.session_state.confirmed_travellers = names
-        st.session_state.booking_ready_url = url
+    st.session_state.slots = slots
+    st.session_state.confirmed_travellers = [n for n in names if n]
+    st.session_state.booking_ready_url = url
+    if ready and st.session_state.get("conversation_id"):
         signature = (flight.get("offer_token") or flight.get("flight_number"), booking_dest, tuple(passengers.values()))
         if st.session_state.get("selection_saved") != signature:
             st.session_state.selection_saved = signature
@@ -1854,22 +2118,35 @@ def _passenger_dialog() -> None:
                 selection_row(st.session_state.conversation_id, flight, passengers, booking_dest, url)
             )
 
+    number = str(flight.get("flight_number") or "").strip()
     with st.container(key="bookcta"):
         st.link_button(
-            "Continue to Booking.com",
-            url or "https://flights.booking.com/",
+            "This fare on Booking.com",
+            url or "#",
             type="primary",
-            icon=":material/arrow_outward:",
             disabled=not ready,
             width="stretch",
         )
-    number = str(flight.get("flight_number") or "").strip()
-    look_for = f"{number} at {flight.get('departure_time')}" if number else f"the {flight.get('departure_time')} departure"
-    st.caption(
-        ("Add each traveller’s name to continue. " if not ready else "")
-        + f"Booking.com opens on this route and day. Pick {look_for} there. "
-        "Names stay on this device."
-    )
+        best = offers_for_fare(
+            _card_offers_cached(),
+            str(flight.get("airline") or ""),
+            fare=float(flight.get("price") or 0),
+            segment=route_segment(origin_code, booking_dest),
+        )
+        best = next((o for o in best if _aggregator_label(o) != "Booking.com"), None)
+        if best and ready:
+            ota = ota_search_url_for_offer(best, origin_code, booking_dest, slots, flight=flight)
+            where = _aggregator_label(best)
+            if where != "Booking.com":
+                flight_bit = number or (flight.get("airline") or "this flight")
+                st.link_button(
+                    f"{flight_bit} on {where}",
+                    ota,
+                    type="secondary",
+                    width="stretch",
+                )
+    if number:
+        st.caption(f"Both open {origin_code} → {booking_dest} on {slots.get('departure_date')}. On the site, book {number} at {flight.get('departure_time')}.")
 
 
 FARE_PAGE = 5
@@ -1911,29 +2188,35 @@ def _render_fare_list(flights: list) -> None:
         st.session_state.fares_for = signature
         st.session_state.fares_shown = FARE_PAGE
 
-    head, sort_col = st.columns([3, 2], vertical_alignment="bottom")
+    head, sort_col = st.columns([3, 2], vertical_alignment="center")
     with head:
-        st.markdown(
-            f'<div class="gx-section">All flights <span class="gx-count">{len(flights)}</span></div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown('<div class="gx-sort-label">Sort</div>', unsafe_allow_html=True)
     with sort_col:
+        if "fare_sort" not in st.session_state:
+            st.session_state.fare_sort = "Best"
         mode = st.segmented_control(
-            "Sort fares", SORT_MODES, default="Best", key="fare_sort", label_visibility="collapsed",
-        ) or "Best"
+            "Sort fares", SORT_MODES, key="fare_sort", label_visibility="collapsed",
+        ) or st.session_state.fare_sort
 
     ranked = _rank_fares(flights, mode)
     shown = ranked[: st.session_state.fares_shown]
     for i, f in enumerate(shown):
         number = str(f.get("flight_number") or "").strip()
         cabin = str(f.get("cabin_class") or "economy").replace("_", " ").title()
-        cut = f.get("discount") or 0
         score = f.get("fit_score")
         band = str(f.get("fit_band") or "")
         score_bit = f"{score}/10 {band}" if score is not None else ""
-        sub = " · ".join(p for p in (_duration_label(f), _stops_label(f), cabin, score_bit) if p)
+        cut = float(f.get("discount") or 0)
+        deal = next((str(b.get("text") or b) for b in (f.get("badges") or []) if b), "")
+        extra = []
+        if cut > 0:
+            extra.append(f"{format_flight_price(cut)} off")
+        if deal:
+            extra.append(deal)
+        extra.append("Booking.com")
+        sub = " · ".join(p for p in (_duration_label(f), _stops_label(f), cabin, score_bit, *extra) if p)
         with st.container(key=f"farerow{i}"):
-            info, price_col, act = st.columns([5, 2, 1.4], vertical_alignment="center")
+            info, price_col, act = st.columns(FARE_COLS, vertical_alignment="center")
             with info:
                 st.markdown(
                     '<div class="gx-row">'
@@ -1945,14 +2228,9 @@ def _render_fare_list(flights: list) -> None:
                     unsafe_allow_html=True,
                 )
             with price_col:
-                st.markdown(
-                    f'<div class="gx-rowfare">{html.escape(format_flight_price(f.get("price")))}'
-                    + (f'<small>{html.escape(format_flight_price(cut))} off</small>' if cut > 0 else "")
-                    + "</div>",
-                    unsafe_allow_html=True,
-                )
+                st.markdown(_price_stack(f), unsafe_allow_html=True)
             with act:
-                if st.button("Select", key=f"choose_fare_{i}", width="stretch"):
+                if st.button("Book", key=f"choose_fare_{i}", type="tertiary"):
                     st.session_state.selected_flight = dict(f)
                     st.session_state.booking_ready_url = None
                     st.rerun()
@@ -1960,9 +2238,141 @@ def _render_fare_list(flights: list) -> None:
     remaining = len(ranked) - len(shown)
     if remaining > 0:
         with st.container(key="faremore"):
-            if st.button(f"Show {min(FARE_PAGE, remaining)} more", key="fares_more", type="tertiary"):
+            if st.button(f"{remaining} more flights", key="fares_more", type="tertiary"):
                 st.session_state.fares_shown += FARE_PAGE
                 st.rerun()
+
+
+def _card_picks_for(state: dict) -> dict:
+    """Top three cards for what this person has said so far. Off the reply path's model call."""
+    try:
+        cards = load_credit_cards()
+        offers = load_card_offers()
+    except Exception:
+        return {}
+    if not cards:
+        return {}
+    said = "\n".join(
+        m.get("content") or "" for m in (state.get("chat_history") or []) if m.get("role") == "user"
+    )
+    said = f"{said}\n{state.get('user_message') or ''}"
+    slots = state.get("slots") or {}
+    origin = ((slots.get("origin") or {}).get("airport_code")) or ""
+    dest = ((slots.get("destination") or {}).get("airport_code")) or ""
+    flights = state.get("last_search_results") or []
+    priced = [f for f in flights if f.get("price")]
+    cheapest = min(priced, key=lambda f: float(f["price"])) if priced else {}
+    try:
+        fare = float(cheapest.get("price") or 0)
+    except (TypeError, ValueError):
+        fare = 0.0
+    return suggest_cards(
+        said, cards, offers,
+        airline=str(cheapest.get("airline") or ""),
+        fare=fare,
+        segment=route_segment(str(origin), str(dest)) if origin and dest else "any",
+    )
+
+
+def _render_card_picks() -> None:
+    """The card agent's answer, under the fares it was picked against."""
+    data = st.session_state.get("card_picks") or {}
+    picks = data.get("picks") or []
+    if not picks:
+        return
+    rows = []
+    flights = st.session_state.get("last_search_results") or []
+    priced = [f for f in flights if f.get("price")]
+    anchor = min(priced, key=lambda f: float(f["price"])) if priced else {}
+    slots = st.session_state.get("slots") or {}
+    o_code, d_code = route_codes_from_flight(anchor, slots) if anchor else ("", "")
+    book_slots = booking_slots_for_flight(anchor, slots, d_code) if anchor else slots
+    for i, p in enumerate(picks, 1):
+        fee = p.get("annual_fee")
+        fee_txt = "no annual fee" if fee is not None and float(fee) == 0 else (f"₹{float(fee):,.0f}/yr" if fee is not None else "")
+        link = p.get("listing_url") or ""
+        refs = []
+        if link:
+            refs.append(f'<a class="gx-ref" href="{html.escape(link)}" target="_blank" rel="noopener">Card</a>')
+        if p.get("terms_url"):
+            refs.append(f'<a class="gx-ref" href="{html.escape(p["terms_url"])}" target="_blank" rel="noopener">Bank terms</a>')
+        if p.get("merchant") and o_code and d_code:
+            offer_stub = {"merchant": p.get("merchant"), "code": p.get("code")}
+            trip = ota_search_url_for_offer(offer_stub, o_code, d_code, book_slots, flight=anchor)
+            where = _aggregator_label(offer_stub)
+            if where != "Booking.com":
+                refs.append(
+                    f'<a class="gx-ref" href="{html.escape(trip)}" target="_blank" rel="noopener">Open {html.escape(where)}</a>'
+                )
+        rows.append(
+            f'<div class="gx-pick-row">'
+            f'<span class="gx-pick-n">{i}</span>'
+            f'<span class="gx-pick-name">{html.escape(p["card_name"])}</span>'
+            f'<span class="gx-pick-fee">{html.escape(fee_txt)}</span>'
+            f'<span class="gx-pick-why">{html.escape(_clip_text(p.get("reason") or ""))}'
+            + (f' · {" · ".join(refs)}' if refs else "")
+            + "</span></div>"
+        )
+    top = picks[0]
+    saving = top.get("saving")
+    gain = f"about ₹{float(saving):,.0f} off" if saving else "a live discount"
+    where = _aggregator_label({"merchant": top.get("merchant")}) if top.get("merchant") else "the booking site"
+    with st.expander(f"{top['card_name']} · {gain} on {where}", expanded=False):
+        st.markdown('<div class="gx-picks">' + "".join(rows) + "</div>", unsafe_allow_html=True)
+
+
+def _render_search_offers(flights: list) -> None:
+    """Coupons for one site, on the same columns as the fare rows above."""
+    priced = [f for f in flights if f.get("price")]
+    if not priced:
+        return
+    cheapest = min(priced, key=lambda f: float(f["price"]))
+    fare = float(cheapest.get("price") or 0)
+    airline = str(cheapest.get("airline") or "")
+    origin = str(cheapest.get("origin_code") or "")
+    dest = str(cheapest.get("destination_code") or "")
+    ranked = offers_for_fare(
+        _card_offers_cached(), airline, fare=fare, segment=route_segment(origin, dest),
+    )
+    site = _lead_site(ranked)
+    matches = _offers_for_site(ranked, site)[:4]
+    if not matches:
+        return
+    base_slots = st.session_state.get("slots") or {}
+    slots = booking_slots_for_flight(cheapest, base_slots, dest)
+    st.markdown(
+        f'<div class="gx-section">Bank offers and coupons on {html.escape(site)}</div>',
+        unsafe_allow_html=True,
+    )
+    for i, offer in enumerate(matches):
+        code = str(offer.get("code") or "").strip()
+        title = _short_offer_title(offer.get("title") or "")
+        if code and code in title:
+            title = re.sub(rf"\s*[·\-–]?\s*{re.escape(code)}\s*", " ", title).strip(" ·-")
+        amount = _offer_amount(offer, fare)
+        ref = offer.get("detail_url") or offer.get("terms_url") or ""
+        trip = ota_search_url_for_offer(offer, origin, dest, slots, flight=cheapest)
+        with st.container(key=f"couponrow{i}"):
+            info, price_col, act = st.columns(FARE_COLS, vertical_alignment="center")
+            with info:
+                st.markdown(
+                    '<div class="gx-row">'
+                    f'<div class="when"><b>{html.escape(offer.get("bank") or site)}</b>'
+                    + (f'<span class="gx-code">{html.escape(code)}</span>' if code else "")
+                    + "</div>"
+                    f'<div class="sub">{html.escape(title)}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with price_col:
+                st.markdown(
+                    f'<div class="gx-price"><b>{html.escape(amount)}</b></div>',
+                    unsafe_allow_html=True,
+                )
+            with act:
+                if trip:
+                    st.link_button(site, trip, type="tertiary")
+                elif ref:
+                    st.link_button("Terms", ref, type="tertiary")
 
 
 def _render_trip_board() -> None:
@@ -1974,12 +2384,14 @@ def _render_trip_board() -> None:
     dest_code = None
     if scan and (scan.get("series") or []):
         dest_code = scan["series"][0].get("code")
-    if origin and dest:
-        _render_route_experience(slots, dest_code=dest_code)
     if not flights and scan:
         _render_window_scan(slots, scan)
+        if origin and dest:
+            _render_route_experience(slots, dest_code=dest_code)
         return
     if not flights:
+        if origin and dest:
+            _render_route_experience(slots, dest_code=dest_code)
         return
 
     date = slots.get("departure_date")
@@ -1987,13 +2399,19 @@ def _render_trip_board() -> None:
     when = date or "Dates still open"
     if ret:
         when = f"{date} → {ret}"
-    st.markdown(f'<div class="gx-section">{html.escape(_route_label(slots))}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="gx-note">{html.escape(str(when))} · every fare from this search</div>', unsafe_allow_html=True)
-
+    st.markdown(
+        f'<div class="gx-section">Fares <span class="gx-count">{len(flights)}</span></div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div class="gx-note">{html.escape(_route_label(slots))} · {html.escape(str(when))} · prices from Booking.com</div>',
+        unsafe_allow_html=True,
+    )
     _render_fare_list(flights)
-
-    with st.expander("How each fare is built · discounts and badges", expanded=False):
-        _render_fare_desk(flights)
+    _render_search_offers(flights)
+    _render_card_picks()
+    if origin and dest:
+        _render_route_experience(slots, dest_code=dest_code)
 
 
 def _place_label(slots: dict, key: str) -> str:
@@ -2447,9 +2865,10 @@ def _layout_for(photo_url: str) -> None:
           .st-key-path2 .gx-path {{ animation-delay: 0.12s; }}
           .st-key-pathactive .gx-path {{ border-color: #E6C56A; box-shadow: 0 10px 28px rgba(230, 168, 0, 0.14); }}
           .gx-path .t {{ font-size: 0.8rem; letter-spacing: 0.08em; text-transform: uppercase; color: #8A8175; }}
-          .gx-pick {{
+          .gx-path-badge {{
             background: #F5C400; color: #3F3A34; border-radius: 999px; padding: 2px 8px;
             font-size: 0.66rem; letter-spacing: 0.06em; margin-left: 6px; vertical-align: middle;
+            display: inline-block;
           }}
           .gx-path .p {{ font-size: 1.85rem; font-weight: 560; letter-spacing: -0.03em; color: #1A1714; margin: 0.25rem 0 0.2rem; }}
           .gx-path .w {{ font-size: 0.9rem; color: #5C564E; line-height: 1.4; }}
@@ -2703,10 +3122,69 @@ def _layout_for(photo_url: str) -> None:
             padding: 0.9rem 1rem 0.8rem;
             background: linear-gradient(180deg, #FFFFFF 0%, #FAFBFC 100%);
           }}
+          .gx-offers {{
+            margin-top: 0.6rem; padding: 0.85rem 1.05rem 0.7rem;
+            border: 1px solid #F3D2B0; border-radius: 14px; background: #FFFCF8;
+          }}
+          .gx-coupon-mark {{
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 1.15rem; height: 1.15rem; margin-right: 0.35rem;
+            border-radius: 999px; background: #E7F6EE; color: #1F8A4C;
+            font-size: 0.72rem; font-weight: 750;
+          }}
+          .gx-offers-h {{ font-size: 0.84rem; font-weight: 650; letter-spacing: 0; text-transform: none; color: #20262D; margin-bottom: 0.45rem; }}
+          .gx-offer {{ display: grid; grid-template-columns: 1fr auto; column-gap: 0.7rem; row-gap: 0.08rem; padding: 0.45rem 0; border-top: 1px dashed #F3D2B0; align-items: baseline; }}
+          .gx-offer:first-of-type {{ border-top: 0; }}
+          .gx-offer-bank {{ font-size: 0.8rem; font-weight: 650; color: #20262D; }}
+          .gx-offer-amt {{ font-size: 0.78rem; font-weight: 650; color: #2E8B57; text-align: right; white-space: nowrap; }}
+          .gx-offer-text {{ grid-column: 1 / -1; font-size: 0.82rem; color: #20262D; }}
+          .gx-offer-meta {{ grid-column: 1 / -1; font-size: 0.74rem; color: #8A929B; }}
+          .gx-ref {{ color: #C56A2D !important; font-weight: 650; text-decoration: none !important; }}
+          .gx-ref:hover {{ text-decoration: underline !important; text-underline-offset: 2px; }}
+          .gx-sort-label {{ font-size: 0.72rem; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; color: #8A929B; }}
+          .gx-offer-note {{ margin-top: 0.4rem; font-size: 0.72rem; color: #8A929B; }}
+          .gx-cards {{
+            margin-top: 0.15rem; padding: 0.35rem 0.35rem 0.15rem;
+            border: 0; background: transparent;
+          }}
+          .gx-cards-h {{ color: #8A929B; }}
+          .gx-card {{
+            display: grid; grid-template-columns: 1fr auto; column-gap: 0.6rem; row-gap: 0.1rem;
+            padding: 0.45rem 0; border-top: 1px solid #F0F2F4; text-decoration: none !important; color: inherit;
+          }}
+          .gx-card:first-of-type {{ border-top: 0; }}
+          .gx-card:hover .gx-card-name {{ color: #E08A4F; }}
+          .gx-card-name {{ font-size: 0.86rem; font-weight: 650; color: #20262D; }}
+          .gx-card-gain {{ font-size: 0.78rem; font-weight: 650; color: #2E8B57; white-space: nowrap; text-align: right; }}
+          .gx-card-pitch {{ grid-column: 1 / -1; font-size: 0.78rem; color: #4B535C; line-height: 1.35; }}
+          .gx-card-meta {{ grid-column: 1 / -1; font-size: 0.72rem; color: #8A929B; }}
+          .gx-picks, .gx-stepbox {{
+            margin: 0.85rem 0 0.4rem; padding: 0.75rem 0.95rem 0.6rem;
+            border: 1px solid #E6EAEE; border-radius: 14px; background: #FFFFFF;
+          }}
+          .gx-pick-line {{ font-size: 0.78rem; color: #8A929B; margin: -0.1rem 0 0.2rem; }}
+          .gx-picks .gx-pick-row {{
+            display: grid; grid-template-columns: 1.15rem 1fr auto; column-gap: 0.6rem; row-gap: 0.12rem;
+            padding: 0.55rem 0; border-top: 1px solid #F0F2F4; align-items: baseline;
+            background: transparent !important; border-radius: 0 !important;
+          }}
+          .gx-picks .gx-pick-row:first-of-type {{ border-top: 0; }}
+          .gx-trip-hint {{ color: #69727D; font-weight: 550; }}
+          .gx-ref-trip {{ font-weight: 700 !important; }}
+          .gx-pick-n {{ font-size: 0.74rem; font-weight: 650; color: #E08A4F; }}
+          .gx-pick-name {{ font-size: 0.88rem; font-weight: 650; color: #20262D; }}
+          .gx-pick-fee {{ font-size: 0.74rem; color: #8A929B; white-space: nowrap; text-align: right; }}
+          .gx-pick-why {{ grid-column: 2 / -1; font-size: 0.78rem; color: #4B535C; line-height: 1.4; }}
           .gx-ticket .top {{ display: flex; justify-content: space-between; align-items: baseline; }}
           .gx-ticket .who {{ font-weight: 650; color: #20262D; font-size: 0.92rem; }}
           .gx-ticket .who em {{ font-style: normal; color: #8A929B; font-weight: 550; margin-left: 0.25rem; }}
-          .gx-ticket .fare {{ font-weight: 700; color: #20262D; font-size: 1.12rem; }}
+          .gx-price {{
+            display: flex; flex-direction: column; align-items: flex-end; line-height: 1.15;
+          }}
+          .gx-price small {{ font-size: 0.7rem; color: #2F7D4F; font-weight: 650; }}
+          .gx-price s {{ font-size: 0.75rem; color: #9AA2AB; font-weight: 550; text-decoration: line-through; }}
+          .gx-price b {{ font-size: 1rem; font-weight: 700; color: #20262D; }}
+          .gx-ticket .gx-price b {{ font-size: 1.12rem; }}
           .gx-ticket .leg {{
             display: grid; grid-template-columns: auto 1fr auto; gap: 0.8rem;
             align-items: center; margin: 0.75rem 0 0.55rem;
@@ -2751,24 +3229,50 @@ def _layout_for(photo_url: str) -> None:
             border-color: #20262D !important;
             color: #FFFFFF !important;
           }}
-          .st-key-bookcta [data-testid="stLinkButton"] a {{
+          .st-key-bookcta [data-testid="stLinkButton"]:first-of-type a {{
             min-height: 46px;
             border: 0 !important;
             border-radius: 13px !important;
-            background: #F4C84A !important;
-            color: #20262D !important;
+            background: #20262D !important;
+            color: #FFFFFF !important;
             font-weight: 650 !important;
             font-size: 0.9rem !important;
-            box-shadow: 0 6px 16px rgba(165,126,0,0.16) !important;
+            box-shadow: 0 8px 20px rgba(32,38,45,0.18) !important;
             transition: transform 0.16s ease, box-shadow 0.16s ease;
           }}
-          .st-key-bookcta [data-testid="stLinkButton"] a:hover {{
+          .st-key-bookcta [data-testid="stLinkButton"]:first-of-type a:hover {{
             transform: translateY(-1px);
-            box-shadow: 0 10px 22px rgba(165,126,0,0.2) !important;
+            box-shadow: 0 12px 26px rgba(32,38,45,0.22) !important;
+          }}
+          .st-key-bookcta [data-testid="stLinkButton"]:not(:first-of-type) a {{
+            min-height: 44px;
+            border: 1px solid #D5DCE3 !important;
+            border-radius: 13px !important;
+            background: #FFFFFF !important;
+            color: #20262D !important;
+            font-weight: 600 !important;
+            font-size: 0.86rem !important;
+            box-shadow: none !important;
           }}
           .st-key-bookcta [data-testid="stLinkButton"] a[disabled],
           .st-key-bookcta [data-testid="stLinkButton"] a[aria-disabled="true"] {{
             background: #EEF1F4 !important; color: #9AA2AB !important; box-shadow: none !important;
+            border-color: #EEF1F4 !important;
+          }}
+          div[role="dialog"] .gx-offers,
+          div[role="dialog"] .gx-cards,
+          div[role="dialog"] .gx-picks {{
+            padding-left: 0.15rem;
+            padding-right: 0.35rem;
+          }}
+          div[role="dialog"] [data-testid="stExpander"] details {{
+            border-color: #E6EAEE !important;
+            background: #FFFFFF;
+          }}
+          div[role="dialog"] [data-testid="stExpander"] summary {{
+            font-size: 0.86rem !important;
+            font-weight: 650 !important;
+            color: #20262D !important;
           }}
           .gx-count {{
             display: inline-block; margin-left: 0.35rem; padding: 0.05rem 0.5rem;
@@ -2776,41 +3280,84 @@ def _layout_for(photo_url: str) -> None:
             font-size: 0.72rem; font-weight: 650; vertical-align: 0.1rem;
           }}
           .st-key-sheet [class*="st-key-farerow"] {{
-            background: #FFFFFF;
-            border: 1px solid #E5E9ED;
-            border-radius: 14px;
-            padding: 0.55rem 0.6rem 0.55rem 0.95rem;
-            margin-bottom: -0.45rem;
-            transition: border-color 0.16s ease, box-shadow 0.16s ease;
+            background: transparent;
+            border: 0;
+            border-bottom: 1px solid #EEF1F4;
+            border-radius: 0;
+            padding: 0.15rem 0 0.15rem;
+            margin: 0;
+            box-shadow: none;
           }}
           .st-key-sheet [class*="st-key-farerow"]:hover {{
-            border-color: #D3DAE1;
-            box-shadow: 0 6px 18px rgba(30,41,59,0.06);
+            border-color: #EEF1F4;
+            box-shadow: none;
+            background: transparent;
           }}
           .gx-row .when {{ display: flex; gap: 0.45rem; align-items: baseline; }}
           .gx-row .when b {{ font-size: 1rem; font-weight: 650; color: #20262D; }}
           .gx-row .when span {{ color: #A0A7AF; font-size: 0.8rem; }}
+          .gx-code {{
+            margin-left: 0.45rem;
+            padding: 0.05rem 0.4rem;
+            border-radius: 6px;
+            background: #F4F6F8;
+            color: #3D4650 !important;
+            font-size: 0.72rem !important;
+            font-weight: 700;
+            letter-spacing: 0.03em;
+          }}
           .gx-row .sub {{ font-size: 0.76rem; color: #6F7882; font-weight: 550; margin-top: 0.1rem; }}
-          .gx-rowfare {{ text-align: right; font-weight: 700; color: #20262D; font-size: 1rem; white-space: nowrap; }}
-          .gx-rowfare small {{ display: block; font-size: 0.7rem; color: #2F7D4F; font-weight: 600; }}
+          .st-key-sheet .gx-price {{ white-space: nowrap; }}
           .st-key-sheet [class*="st-key-farerow"] .stButton > button {{
-            min-height: 34px;
-            border-radius: 10px !important;
-            border: 1px solid #DCE2E8 !important;
-            background: #FFFFFF !important;
-            color: #20262D !important;
-            font-size: 0.78rem !important;
+            min-height: 0 !important;
+            height: auto !important;
+            padding: 0.15rem 0 !important;
+            border: 0 !important;
+            border-radius: 0 !important;
+            background: transparent !important;
+            color: #C56A2D !important;
+            font-size: 0.84rem !important;
             font-weight: 650 !important;
             box-shadow: none !important;
-            transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease;
+            justify-content: flex-end;
           }}
           .st-key-sheet [class*="st-key-farerow"] .stButton > button:hover {{
-            background: #20262D !important; border-color: #20262D !important; color: #FFFFFF !important;
+            background: transparent !important;
+            color: #20262D !important;
+            text-decoration: underline;
+            text-underline-offset: 3px;
           }}
-          .st-key-sheet .st-key-faremore {{ display: flex; justify-content: center; margin-top: 0.5rem; }}
+          .st-key-sheet [class*="st-key-couponrow"] {{
+            background: transparent;
+            border: 0;
+            border-bottom: 1px solid #EEF1F4;
+            border-radius: 0;
+            padding: 0.15rem 0;
+            margin: 0;
+          }}
+          .st-key-sheet [class*="st-key-couponrow"] [data-testid="stLinkButton"] a {{
+            min-height: 0 !important;
+            height: auto !important;
+            padding: 0.15rem 0 !important;
+            border: 0 !important;
+            background: transparent !important;
+            color: #C56A2D !important;
+            font-size: 0.84rem !important;
+            font-weight: 650 !important;
+            box-shadow: none !important;
+            justify-content: flex-end;
+          }}
+          .st-key-sheet [class*="st-key-couponrow"] .gx-price b {{
+            color: #2E8B57;
+            font-size: 0.92rem;
+          }}
+          .st-key-sheet .st-key-faremore {{ display: flex; justify-content: flex-start; margin: 0.1rem 0 0.2rem; }}
           .st-key-sheet .st-key-faremore button {{
-            color: #4A535D !important; font-size: 0.8rem !important; font-weight: 650 !important;
+            min-height: 0 !important; padding: 0.15rem 0 !important;
+            background: transparent !important; border: 0 !important; box-shadow: none !important;
+            color: #8A929B !important; font-size: 0.8rem !important; font-weight: 600 !important;
           }}
+          .st-key-sheet .st-key-faremore button:hover {{ color: #20262D !important; }}
           @keyframes gx-rise {{
             from {{ opacity: 0; transform: translateY(24px); }}
             to {{ opacity: 1; transform: none; }}
@@ -3228,6 +3775,7 @@ def main() -> None:
                     st.session_state.pending_shown = False
                     st.session_state.stopped_note = False
                     st.session_state.agent_trace = None
+                    st.session_state.card_picks = None
                     st.session_state.selected_flight = None
                     st.session_state.booking_ready_url = None
                     st.session_state.confirmed_travellers = []
