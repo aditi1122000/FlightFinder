@@ -2,10 +2,10 @@ name: Scrape travel cards
 
 # Diagram: "Travel cards — batch scrape"
 # Public comparison listings → credit_cards (travel cards only).
-# Cadence: Mon/Wed/Fri once (IST 07:30).
+# Cadence: 1st of each month (IST 07:30).
 on:
   schedule:
-    - cron: "0 2 * * 1,3,5"
+    - cron: "0 2 1 * *"
   workflow_dispatch:
 
 jobs:

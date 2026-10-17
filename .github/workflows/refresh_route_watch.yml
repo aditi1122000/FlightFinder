@@ -2,10 +2,8 @@ name: Refresh route watch
 
 # Optional fare-API batch (not HTML scrape): recent routes → fare_discounts,
 # six watched routes → route_watch. Needs RapidAPI secrets.
-# Cadence: Mon/Wed/Fri once (IST 08:15).
+# Cadence: paused (manual only). Was Mon/Wed/Fri IST 08:15 — cron "45 2 * * 1,3,5".
 on:
-  schedule:
-    - cron: "45 2 * * 1,3,5"
   workflow_dispatch:
 
 jobs:
