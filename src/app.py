@@ -18,6 +18,7 @@ import re
 import threading
 import time
 import uuid
+from datetime import date, datetime
 
 import streamlit as st
 
@@ -96,7 +97,51 @@ from src.services.flight_services import (
 )
 from src.services.summarisation import ensure_user_summary_updated, get_user_summary
 from src.services.offers import offers_for_fare, estimate_saving, route_segment, suggest_cards
+from src.staging import flights_for as staging_flights
+from src.staging import slots_from_query as staging_slots
 from src.services.supabase_persistence import load_card_offers, load_credit_cards
+
+try:
+    from src.services.points_transfer import (
+        wallet_cards,
+        best_transfer,
+        net_price,
+        match_wallet_card,
+        best_card_net,
+        transfer_options,
+    )
+except Exception:  # feature agent fills src/services/points_transfer.py
+    def wallet_cards():
+        return []
+
+    def best_transfer(card_id, airline, points, program_id=None):
+        return None
+
+    def transfer_options(card_id):
+        return []
+
+    def net_price(flight, offer, card_id, points, estimate_saving):
+        cash = float((flight or {}).get("price") or 0)
+        return {
+            "base_fare": float((flight or {}).get("base_fare") or 0),
+            "tax": float((flight or {}).get("tax") or 0),
+            "fee": float((flight or {}).get("fee") or 0),
+            "cash": cash,
+            "list_price": float((flight or {}).get("list_price") or cash),
+            "discount": float((flight or {}).get("discount") or 0),
+            "offer_saving": 0,
+            "points_value": 0,
+            "transfer": None,
+            "you_pay": cash,
+            "offer": offer,
+        }
+
+    def match_wallet_card(credit_card_row):
+        return None
+
+    def best_card_net(flight, offer_by_card, points, estimate_saving, program_id=None):
+        return net_price(flight, None, None, 0, estimate_saving)
+
 from src.services.route_experience import (
     build_route_snapshot,
     leaflet_route_html,
@@ -158,9 +203,9 @@ def _append_message(role: str, content: str) -> None:
     user_name = st.session_state.get("user_name") or None
     st.session_state.chat_history.append({"role": role, "content": content})
     _persist_message_later(
-        st.session_state.conversation_id,
-        role,
-        content,
+            st.session_state.conversation_id,
+            role,
+            content,
         dict(st.session_state.slots),
         turn_index,
         user_name,
@@ -191,15 +236,23 @@ def _apply_graph_result(final_state: dict) -> None:
         turn_index = st.session_state.get("turn_index", 1)
         user_name = st.session_state.get("user_name") or None
         _persist_message_later(
-            st.session_state.conversation_id,
-            last_msg["role"],
-            last_msg["content"],
+                st.session_state.conversation_id,
+                last_msg["role"],
+                last_msg["content"],
             dict(final_state["slots"]),
             turn_index,
             user_name,
         )
         st.session_state.turn_index = turn_index + 1
-    st.session_state.last_search_results = final_state.get("last_search_results")
+    incoming = final_state.get("last_search_results") or []
+    live = [row for row in incoming if str(row.get("provider") or "") != "sample"]
+    if live:
+        st.session_state.last_search_results = incoming
+        st.session_state.live_fares = True
+        st.session_state.desk_step = "trip"
+    elif incoming and not st.session_state.get("last_search_results"):
+        st.session_state.last_search_results = incoming
+        st.session_state.desk_step = "trip"
     st.session_state.last_search_params = final_state.get("last_search_params")
     st.session_state.price_stats = final_state.get("price_stats")
     st.session_state.error_context = final_state.get("error_context")
@@ -224,22 +277,22 @@ def _apply_graph_result(final_state: dict) -> None:
 
 def _build_initial_state(user_input: str) -> dict:
     return {
-        "status": "clarification_needed",
-        "user_message": user_input,
-        "chat_history": list(st.session_state.chat_history),
-        "slots": st.session_state.slots,
-        "conversational_message": None,
-        "missing_slots": [],
-        "flights": [],
-        "last_search_results": st.session_state.get("last_search_results"),
-        "last_search_params": st.session_state.get("last_search_params"),
-        "price_stats": st.session_state.get("price_stats"),
-        "error_context": st.session_state.get("error_context"),
-        "error_message": None,
-        "suggested_alternatives": st.session_state.get("suggested_alternatives"),
+            "status": "clarification_needed",
+            "user_message": user_input,
+            "chat_history": list(st.session_state.chat_history),
+            "slots": st.session_state.slots,
+            "conversational_message": None,
+            "missing_slots": [],
+            "flights": [],
+            "last_search_results": st.session_state.get("last_search_results"),
+            "last_search_params": st.session_state.get("last_search_params"),
+            "price_stats": st.session_state.get("price_stats"),
+            "error_context": st.session_state.get("error_context"),
+            "error_message": None,
+            "suggested_alternatives": st.session_state.get("suggested_alternatives"),
         "search_history": list(st.session_state.get("search_history") or []),
-        "user_summary": st.session_state.get("user_summary"),
-    }
+            "user_summary": st.session_state.get("user_summary"),
+        }
 
 
 def _is_generation_cancelled(exc: BaseException | None) -> bool:
@@ -373,9 +426,13 @@ def _start_job(user_input: str) -> None:
     }
     st.session_state.job = box
     st.session_state.is_calling_model = True
+    state = _build_initial_state(user_input)
+    if not st.session_state.get("live_fares"):
+        state["last_search_results"] = None
+        state["last_search_params"] = None
     threading.Thread(
         target=_job_worker,
-        args=(graph, _build_initial_state(user_input), st.session_state.get("user_name"), box),
+        args=(graph, state, st.session_state.get("user_name"), box),
         daemon=True,
     ).start()
 
@@ -446,7 +503,7 @@ def _exception_is_rate_limit(exc: BaseException) -> bool:
         if any(k in text for k in ("429", "rate_limited", "rate limit", "too many requests")):
             return True
         cur = cur.__cause__ or cur.__context__
-    return False
+        return False
 
 
 def process_manual_fallback(user_input: str) -> None:
@@ -529,6 +586,8 @@ User: {user_input}"""
         else:
             flights, api_error, api_error_details = search_flights_api(st.session_state.slots, max_results=10)
             st.session_state.last_search_results = flights
+            if flights:
+                st.session_state.desk_step = "trip"
             st.session_state.last_search_params = st.session_state.slots.copy()
             if flights:
                 st.session_state.price_stats = calculate_price_stats(flights)
@@ -700,7 +759,7 @@ def _inject_styles() -> None:
     st.markdown(
         """
         <style>
-          @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap');
+          @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap');
           .stApp, .stMarkdown, .stMarkdown p, .stMarkdown li, .stMarkdown strong,
           [data-testid="stChatMessageContent"], [data-testid="stWidgetLabel"],
           [data-testid="stCaptionContainer"], [data-testid="stTextInput"] input,
@@ -787,7 +846,16 @@ def _inject_styles() -> None:
             gap: 0;
           }
           .st-key-composer [data-testid="stVerticalBlock"],
-          .st-key-composer [data-testid="stHorizontalBlock"] { gap: 0.25rem; align-items: center; }
+          .st-key-composer [data-testid="stHorizontalBlock"] {
+            gap: 0.25rem;
+            align-items: center;
+            flex-wrap: nowrap !important;
+          }
+          .st-key-composer [data-testid="stColumn"]:last-child {
+            flex: 0 0 46px !important;
+            width: 46px !important;
+            min-width: 46px !important;
+          }
           .st-key-composer [data-testid="stTextInput"] { margin-bottom: 0; }
           .st-key-composer [data-testid="InputInstructions"] { display: none; }
           .st-key-composer [data-testid="stTextInput"] input,
@@ -1163,6 +1231,21 @@ def _inject_styles() -> None:
           .stButton > button[kind="primary"] {
             background: #4A453E; color: #fff; border-radius: 999px; border: none; font-weight: 500;
           }
+          .gx-wallet { margin: 0.15rem 0 0.35rem; }
+          .gx-xfer { font-size: 0.82rem; font-weight: 550; color: #4A453E; }
+          .gx-receipt { margin-top: 0.65rem; }
+          .gx-receipt-h { font-size: 0.84rem; font-weight: 650; color: #20262D; margin: 0.45rem 0 0.15rem; }
+          .gx-receipt-row {
+            display: grid; grid-template-columns: 1fr auto; column-gap: 0.7rem; row-gap: 0.08rem;
+            padding: 0.45rem 0; border-top: 1px dashed #E6D9C4; align-items: baseline;
+          }
+          .gx-receipt-row:first-of-type { border-top: 0; }
+          .gx-receipt-name { font-size: 0.8rem; font-weight: 650; color: #20262D; }
+          .gx-receipt-amt { font-size: 0.78rem; font-weight: 650; text-align: right; white-space: nowrap; color: #20262D; }
+          .gx-receipt-amt.save { color: #2E8B57; }
+          .gx-receipt-row.pay .gx-receipt-name,
+          .gx-receipt-row.pay .gx-receipt-amt { font-size: 0.92rem; font-weight: 700; }
+          .gx-receipt-meta { grid-column: 1 / -1; font-size: 0.74rem; color: #8A929B; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1740,13 +1823,148 @@ def _close_booking() -> None:
     st.session_state.booking_ready_url = None
 
 
-def _price_stack(flight: dict) -> str:
-    """Discount above the struck original, then the price you pay."""
+def _inr(amount) -> str:
+    try:
+        return f"₹{float(amount):,.0f}"
+    except (TypeError, ValueError):
+        return "₹0"
+
+
+def _wallet_card_id() -> str | None:
+    raw = st.session_state.get("wallet_card_id")
+    if raw in (None, "", "All cards"):
+        return None
+    return str(raw)
+
+
+def _wallet_points() -> int:
+    raw = st.session_state.get("wallet_points")
+    if raw in (None, ""):
+        return 0
+    try:
+        return max(0, int(float(raw)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _wallet_cards_safe() -> list:
+    try:
+        return list(wallet_cards() or [])
+    except Exception:
+        return []
+
+
+def _rate_text(rate) -> str:
+    try:
+        value = float(rate)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    if abs(value - round(value, 2)) > 0.001:
+        return ""
+    shown = f"{value:.0f}" if abs(value - round(value)) < 0.001 else f"{value:.2f}"
+    return f"₹{shown}/pt"
+
+
+def _pay_card_label(card: dict) -> str:
+    return f'{card.get("name") or "Card"} · {card.get("bank") or ""}'.strip(" ·")
+
+
+def _card_key(bank: str, name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", f"{bank}{name}".lower())
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _pay_cards_cached() -> list:
+    """Axis catalogue, scraped point rates, and the cards already on this screen."""
+    by_key: dict[str, dict] = {}
+
+    def add(row: dict) -> None:
+        bank = (row.get("bank") or "").strip() or "Card"
+        name = (row.get("name") or row.get("card_name") or "").strip()
+        if not name:
+            return
+        try:
+            rate = float(row["inr_per_point"]) if row.get("inr_per_point") not in (None, "") else None
+        except (TypeError, ValueError):
+            rate = None
+        if rate is not None and rate <= 0:
+            rate = None
+        item = {
+            "id": (row.get("id") or row.get("slug") or _card_key(bank, name))[:64],
+            "name": name,
+            "bank": bank,
+            "currency": row.get("currency") or row.get("points_name") or "",
+            "inr_per_point": rate,
+            "source_url": row.get("source_url") or row.get("url") or row.get("listing_url") or "",
+        }
+        key = _card_key(bank, name)
+        prev = by_key.get(key)
+        if prev is None:
+            by_key[key] = item
+            return
+        if prev.get("inr_per_point") is None and rate is not None:
+            item["id"] = prev["id"] or item["id"]
+            by_key[key] = item
+        elif rate is not None and prev.get("inr_per_point") is None:
+            prev["inr_per_point"] = rate
+            prev["currency"] = prev.get("currency") or item["currency"]
+            prev["source_url"] = prev.get("source_url") or item["source_url"]
+
+    try:
+        import json
+        from src.services.axis_points import CACHE_PATH
+        payload = json.loads(CACHE_PATH.read_text())
+        for row in payload.get("cards") or []:
+            add(row)
+    except Exception:
+        logger.debug("Axis card catalogue unavailable", exc_info=True)
+    try:
+        from src.services.supabase_persistence import load_card_point_rates
+        for row in load_card_point_rates() or []:
+            add(row)
+    except Exception:
+        logger.debug("Point-rate table unavailable", exc_info=True)
+    for row in wallet_cards() or []:
+        matched = None
+        for existing in by_key.values():
+            if match_wallet_card({"card_name": existing["name"], "bank": existing["bank"]}) == row["id"]:
+                matched = existing
+                break
+        if matched:
+            if matched.get("inr_per_point") is None:
+                matched["id"] = row["id"]
+            continue
+        add(row)
+    rows = [row for row in by_key.values() if row.get("inr_per_point")]
+    rows.sort(key=lambda card: (
+        0 if "axis" in (card.get("bank") or "").lower() else 1,
+        (card.get("name") or "").lower(),
+    ))
+    return rows
+
+
+def _price_stack(flight: dict, net: dict | None = None, *, you_pay_on: bool = False) -> str:
+    """Listed discount first, then the cash fare, then what you pay when a wallet is set."""
     pay = float(flight.get("price") or 0)
     cut = float(flight.get("discount") or 0)
     listed = float(flight.get("list_price") or 0)
     if listed <= pay and cut > 0:
         listed = pay + cut
+    if you_pay_on and net is not None:
+        cash = float(net.get("cash") if net.get("cash") is not None else pay)
+        you = float(net.get("you_pay") if net.get("you_pay") is not None else cash)
+        bits = ['<span class="gx-price">']
+        if cut > 0 and listed > cash:
+            bits.append(f'<small>{html.escape(_inr(cut))} off</small>')
+        if you < cash - 0.049:
+            bits.append(f'<s>{html.escape(_inr(cash))}</s>')
+        elif cut > 0 and listed > cash:
+            bits.append(f'<s>{html.escape(_inr(listed))}</s>')
+        bits.append(f'<b>{html.escape(_inr(you))}</b>')
+        bits.append("</span>")
+        return "".join(bits)
     if cut > 0 and listed > pay:
         return (
             '<span class="gx-price">'
@@ -1758,7 +1976,7 @@ def _price_stack(flight: dict) -> str:
     return f'<span class="gx-price"><b>{html.escape(format_flight_price(pay))}</b></span>'
 
 
-def _ticket_html(flight: dict) -> str:
+def _ticket_html(flight: dict, net: dict | None = None, *, you_pay_on: bool = False) -> str:
     airline = html.escape(str(flight.get("airline") or "Flight"))
     number = html.escape(str(flight.get("flight_number") or "").strip())
     cabin = str(flight.get("cabin_class") or "economy").replace("_", " ").title()
@@ -1770,7 +1988,7 @@ def _ticket_html(flight: dict) -> str:
         '<div class="gx-ticket">'
         f'<div class="top"><span class="who">{airline}'
         + (f' <em>{number}</em>' if number else "")
-        + f'</span>{_price_stack(flight)}</div>'
+        + f'</span>{_price_stack(flight, net, you_pay_on=you_pay_on)}</div>'
         '<div class="leg">'
         f'<div><b>{html.escape(str(flight.get("departure_time") or ""))}</b>'
         f'<span>{html.escape(str(flight.get("origin_code") or ""))}</span></div>'
@@ -1852,6 +2070,275 @@ def _offers_for_site(offers: list, site: str) -> list:
     return out
 
 
+def _wallet_card_row() -> dict | None:
+    card_id = _wallet_card_id()
+    if not card_id:
+        return None
+    for card in _pay_cards_cached():
+        if card.get("id") == card_id:
+            return card
+    for card in _wallet_cards_safe():
+        if card.get("id") == card_id:
+            return card
+    return None
+
+
+def _site_offers(flight: dict) -> tuple[str, list]:
+    """Offers on the aggregator the book button opens. Fares stay on Booking.com."""
+    airline = str((flight or {}).get("airline") or "")
+    try:
+        fare = float((flight or {}).get("price") or 0)
+    except (TypeError, ValueError):
+        fare = 0.0
+    origin = str((flight or {}).get("origin_code") or "")
+    dest = str((flight or {}).get("destination_code") or "")
+    raw = offers_for_fare(
+        _card_offers_cached(),
+        airline,
+        fare=fare,
+        segment=route_segment(origin, dest) if origin and dest else None,
+    )
+    site = _lead_site(raw)
+    return site, _offers_for_site(raw, site)
+
+
+def _offer_for_wallet(offers: list, card: dict | None) -> dict | None:
+    """The one offer on this site that this card can use."""
+    if not card:
+        return None
+    from src.services.offers import bank_key
+    key = bank_key(card.get("bank"))
+    name = (card.get("name") or "").lower()
+    for offer in offers or []:
+        if bank_key(offer.get("bank")) != key:
+            continue
+        eligible = offer.get("eligible_cards") or []
+        if eligible and not any(
+            name in str(e).lower() or str(e).lower() in name for e in eligible
+        ):
+            continue
+        return offer
+    return None
+
+
+def _lead_offers(flight: dict) -> tuple[str, list, dict | None]:
+    """Site, its offers, and the offer the wallet actually applies."""
+    site, matches = _site_offers(flight)
+    card = _wallet_card_row()
+    chosen = _offer_for_wallet(matches, card) if card else (matches[0] if matches else None)
+    return site, matches, chosen
+
+
+def _cash_net(flight: dict, offer=None) -> dict:
+    cash = float((flight or {}).get("price") or 0)
+    return {
+        "base_fare": float((flight or {}).get("base_fare") or 0),
+        "tax": float((flight or {}).get("tax") or 0),
+        "fee": float((flight or {}).get("fee") or 0),
+        "cash": cash,
+        "list_price": float((flight or {}).get("list_price") or cash),
+        "discount": float((flight or {}).get("discount") or 0),
+        "offer_saving": 0,
+        "points_value": 0,
+        "transfer": None,
+        "you_pay": cash,
+        "offer": offer,
+    }
+
+
+def _program_id() -> str | None:
+    raw = st.session_state.get("wallet_program_id")
+    return str(raw) if raw else None
+
+
+def _flight_net(flight: dict) -> dict:
+    _, matches = _site_offers(flight)
+    points = _wallet_points()
+    program_id = _program_id()
+    card_id = _wallet_card_id()
+    try:
+        if card_id:
+            offer = _offer_for_wallet(matches, _wallet_card_row())
+            out = net_price(
+                flight, offer, card_id, points, estimate_saving, program_id=program_id,
+            )
+        elif points > 0:
+            by_card = {
+                c["id"]: _offer_for_wallet(matches, c) for c in _wallet_cards_safe()
+            }
+            out = best_card_net(
+                flight, by_card, points, estimate_saving, program_id=program_id,
+            )
+        else:
+            out = _cash_net(flight)
+    except Exception:
+        out = None
+    if not isinstance(out, dict):
+        return _cash_net(flight)
+    return _apply_published_points(out, _wallet_card_row(), points)
+
+
+def _apply_published_points(out: dict, card: dict | None, points: int) -> dict:
+    """Balance times the rupee rate printed for this card, taken off the fare."""
+    if not card:
+        return out
+    try:
+        rate = float(card["inr_per_point"]) if card.get("inr_per_point") not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        rate = 0.0
+    if rate <= 0:
+        return out
+    cash = float(out.get("cash") or 0)
+    saving = float(out.get("offer_saving") or 0)
+    room = max(0.0, cash - saving)
+    value = min(room, max(0, points) * rate) if points > 0 else 0.0
+    updated = dict(out)
+    updated["points_value"] = value
+    updated["you_pay"] = max(0.0, cash - saving - value)
+    if value > 0:
+        updated["transfer"] = {
+            "published": True,
+            "matches_airline": True,
+            "points": points,
+            "received": points,
+            "value_inr": value,
+            "inr_per_src_pt": rate,
+            "card_name": card.get("name") or "",
+            "program_name": card.get("currency") or "points",
+            "days": None,
+        }
+    return updated
+
+
+def _wallet_applies(flights: list) -> bool:
+    """True once a balance is entered, or a chosen card has an offer on this fare."""
+    if _wallet_points() > 0:
+        return True
+    if not _wallet_card_id():
+        return False
+    priced = [f for f in flights or [] if (f.get("price") or 0) > 0]
+    if not priced:
+        return False
+    cheapest = min(priced, key=lambda f: f["price"])
+    _, offers = _site_offers(cheapest)
+    return _offer_for_wallet(offers, _wallet_card_row()) is not None
+
+
+def _transfer_line(transfer: dict) -> str:
+    if not transfer:
+        return ""
+    pts = transfer.get("points")
+    if pts is None:
+        pts = _wallet_points()
+    try:
+        pts_i = int(float(pts))
+    except (TypeError, ValueError):
+        pts_i = 0
+    try:
+        received = int(float(transfer.get("received") or 0))
+    except (TypeError, ValueError):
+        received = 0
+    who = transfer.get("card_name") or (_wallet_card_row() or {}).get("name") or "card"
+    program = transfer.get("program_name") or "miles"
+    value = transfer.get("value_inr") if transfer.get("matches_airline") else transfer.get("raw_value_inr")
+    try:
+        value = float(value or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    if transfer.get("published"):
+        return f"{pts_i:,} points"
+    bits = [f"{pts_i:,} {who} → {received:,} {program}"]
+    if value > 0:
+        bits.append(f"about {_inr(value)}")
+    days = transfer.get("days")
+    if days not in (None, ""):
+        try:
+            d = int(days)
+            bits.append("1 day" if d == 1 else f"{d} days")
+        except (TypeError, ValueError):
+            bits.append(str(days))
+    return " · ".join(bits)
+
+
+def _receipt_row(name: str, amount: str, meta: str = "", *, kind: str = "", raw_meta: bool = False) -> str:
+    row_cls = "gx-receipt-row" + (f" {kind}" if kind else "")
+    amt_cls = "gx-receipt-amt"
+    if kind == "save":
+        amt_cls += " save"
+    meta_html = ""
+    if meta:
+        meta_html = f'<span class="gx-receipt-meta">{meta if raw_meta else html.escape(meta)}</span>'
+    return (
+        f'<div class="{row_cls}">'
+        f'<span class="gx-receipt-name">{html.escape(name)}</span>'
+        f'<span class="{amt_cls}">{html.escape(amount)}</span>'
+        f"{meta_html}</div>"
+    )
+
+
+def _receipt_html(flight: dict, net: dict) -> str:
+    rows = []
+    fare = float(net.get("base_fare") or 0)
+    tax = float(net.get("tax") or 0)
+    fee = float(net.get("fee") or 0)
+    if fare > 0:
+        rows.append(_receipt_row("Fare", _inr(fare)))
+    if tax > 0:
+        rows.append(_receipt_row("Tax", _inr(tax)))
+    if fee > 0:
+        rows.append(_receipt_row("Fees", _inr(fee)))
+    if not rows:
+        cash = float(net.get("cash") or flight.get("price") or 0)
+        if cash > 0:
+            rows.append(_receipt_row("Fare", _inr(cash)))
+
+    site, _, _ = _lead_offers(flight)
+    cash = float(net.get("cash") or flight.get("price") or 0)
+    offer = net.get("offer") or None
+    saving = float(net.get("offer_saving") or 0)
+    if offer and site and saving > 0:
+        code = str(offer.get("code") or "").strip()
+        title = _short_offer_title(offer.get("title") or "")
+        if code and code in title:
+            title = re.sub(rf"\s*[·\-–]?\s*{re.escape(code)}\s*", " ", title).strip(" ·-")
+        ref = offer.get("detail_url") or offer.get("terms_url") or ""
+        meta_bits = [html.escape(p) for p in (title, site) if p]
+        if code:
+            meta_bits.append(f"<b>{html.escape(code)}</b>")
+        if ref:
+            meta_bits.append(
+                f'<a class="gx-ref" href="{html.escape(ref)}" target="_blank" rel="noopener">Terms</a>'
+            )
+        rows.append(
+            _receipt_row(
+                offer.get("bank") or site,
+                f"− {_inr(saving)}",
+                " · ".join(meta_bits),
+                kind="save",
+                raw_meta=True,
+            )
+        )
+
+    transfer = net.get("transfer") or {}
+    points_value = float(net.get("points_value") or 0)
+    if transfer.get("matches_airline") and points_value > 0:
+        rows.append(
+            _receipt_row("Points", f"− {_inr(points_value)}", _transfer_line(transfer), kind="save")
+        )
+
+    you = float(net.get("you_pay") if net.get("you_pay") is not None else cash)
+    rows.append(_receipt_row("You pay", _inr(you), kind="pay"))
+    return f'<div class="gx-receipt">{"".join(rows)}</div>'
+
+
+def _render_offer_list(offers: list, fare: float) -> None:
+    """Fixed-height offer list with a scrollbar so long banks don't stretch the page."""
+    if not offers:
+        return
+    body = "".join(_offer_html(offer, fare) for offer in offers)
+    st.markdown(f'<div class="gx-offer-scroll">{body}</div>', unsafe_allow_html=True)
+
+
 def _offer_html(
     offer: dict,
     fare: float = 0.0,
@@ -1899,62 +2386,27 @@ def _clip_text(text: str, limit: int = 140) -> str:
     return t[: limit - 1].rsplit(" ", 1)[0] + "…"
 
 
-def _render_card_offers(flight: dict) -> None:
-    """Deals that might cut this fare at payment. Listed, not promised."""
+def _render_card_offers(flight: dict, net: dict | None = None) -> None:
+    """Receipt first (fare, site offers, points), then cards someone could apply for."""
+    if net is None:
+        net = _flight_net(flight)
+    st.markdown(_receipt_html(flight, net), unsafe_allow_html=True)
     airline = str(flight.get("airline") or "")
     try:
         fare = float(flight.get("price") or 0)
     except (TypeError, ValueError):
         fare = 0.0
-    all_offers = _card_offers_cached()
-    if not all_offers:
-        return
     cards = _credit_cards_cached()
-    chosen = None
+    all_offers = _card_offers_cached()
+    if not cards or not all_offers:
+        return
     base_slots = st.session_state.get("slots") or {}
     origin_code, dest_code = route_codes_from_flight(flight, base_slots)
-    segment = route_segment(origin_code, dest_code)
-    book_slots = booking_slots_for_flight(flight, base_slots, dest_code)
-    bank = None
-
-    raw = offers_for_fare(
-        all_offers, airline, bank=None, fare=fare, segment=segment,
+    _render_card_suggestions(
+        cards, all_offers, airline, fare,
+        exclude_bank=None,
+        segment=route_segment(origin_code, dest_code),
     )
-    site = _lead_site(raw)
-    matches = _offers_for_site(raw, site)[:4]
-    fare_cut = float(flight.get("discount") or 0)
-    items = []
-    if fare_cut > 0:
-        items.append(
-            f'<div class="gx-offer"><span class="gx-offer-bank">In this fare</span>'
-            f'<span class="gx-offer-text">₹{fare_cut:,.0f} already taken off the list price</span>'
-            f'<span class="gx-offer-meta">no code needed</span></div>'
-        )
-    for o in matches:
-        trip_url = ota_search_url_for_offer(o, origin_code, dest_code, book_slots, flight=flight)
-        items.append(_offer_html(o, fare, trip_url=trip_url))
-    if chosen and chosen.get("co_brand") and chosen["co_brand"].lower() == airline.lower():
-        items.append(
-            f'<div class="gx-offer"><span class="gx-offer-bank">{html.escape(chosen["bank"])}</span>'
-            f'<span class="gx-offer-text">{html.escape(chosen["card_name"])} earns its {html.escape(airline)} rate on top</span>'
-            f'<span class="gx-offer-meta">co-branded card</span></div>'
-        )
-    if not items and chosen:
-        items.append(
-            f'<div class="gx-offer"><span class="gx-offer-bank">{html.escape(chosen["bank"])}</span>'
-            f'<span class="gx-offer-text">No listed offer on this fare right now</span></div>'
-        )
-    if items:
-        st.markdown(
-            f'<div class="gx-offers gx-coupons"><div class="gx-offers-h"><span class="gx-coupon-mark">%</span> Bank offers and coupons on {html.escape(site or "this fare")}</div>'
-            + "".join(items)
-            + "</div>",
-            unsafe_allow_html=True,
-        )
-
-    # Section 2: cards the traveller doesn't hold that would cut this fare. Opt-in, not a pitch.
-    if cards:
-        _render_card_suggestions(cards, all_offers, airline, fare, exclude_bank=bank, segment=segment)
 
 
 def _short_offer_title(title: str) -> str:
@@ -1972,6 +2424,9 @@ def _render_card_suggestions(cards: list, all_offers: list, airline: str, fare: 
     for c in cards:
         key = bank_key(c["bank"])
         if exclude_bank and key == bank_key(exclude_bank):
+            continue
+        held = _wallet_card_id()
+        if held and match_wallet_card(c) == held:
             continue
         bank_deals = offers_for_fare(by_bank.get(key, []), airline, card_name=c["card_name"], fare=fare, segment=segment)
         if not bank_deals:
@@ -2021,7 +2476,7 @@ def _render_card_suggestions(cards: list, all_offers: list, airline: str, fare: 
     top_card, top_offer, top_saving = top[3], top[4], top[5]
     gain = f"about ₹{top_saving:,.0f} off" if top_saving else _offer_amount(top_offer, fare)
     with st.expander(
-        f"{top_card['card_name']} · {gain} on {_aggregator_label(top_offer)}",
+        f"{gain} with {top_card['card_name']} on {_aggregator_label(top_offer)}",
         expanded=False,
     ):
         st.markdown('<div class="gx-cards">' + "".join(rows) + "</div>", unsafe_allow_html=True)
@@ -2035,8 +2490,10 @@ def _passenger_dialog() -> None:
         return
     base_slots = st.session_state.get("slots") or {}
     origin_code, dest_code = route_codes_from_flight(flight, base_slots)
-    st.markdown(_ticket_html(flight), unsafe_allow_html=True)
-    _render_card_offers(flight)
+    net = _flight_net(flight)
+    you_pay_on = _wallet_applies([flight])
+    st.markdown(_ticket_html(flight, net, you_pay_on=you_pay_on), unsafe_allow_html=True)
+    _render_card_offers(flight, net)
 
     booking_dest = dest_code
     city, siblings = sibling_airports(dest_code)
@@ -2127,33 +2584,39 @@ def _passenger_dialog() -> None:
             disabled=not ready,
             width="stretch",
         )
-        best = offers_for_fare(
-            _card_offers_cached(),
-            str(flight.get("airline") or ""),
-            fare=float(flight.get("price") or 0),
-            segment=route_segment(origin_code, booking_dest),
-        )
-        best = next((o for o in best if _aggregator_label(o) != "Booking.com"), None)
-        if best and ready:
-            ota = ota_search_url_for_offer(best, origin_code, booking_dest, slots, flight=flight)
-            where = _aggregator_label(best)
-            if where != "Booking.com":
+        applied_offer = net.get("offer")
+        if not applied_offer:
+            listed = offers_for_fare(
+                _card_offers_cached(),
+                str(flight.get("airline") or ""),
+                fare=float(flight.get("price") or 0),
+                segment=route_segment(origin_code, booking_dest),
+            )
+            applied_offer = next((o for o in listed if _aggregator_label(o) != "Booking.com"), None)
+        if applied_offer and ready:
+            ota = ota_search_url_for_offer(applied_offer, origin_code, booking_dest, slots, flight=flight)
+            offer_site = _aggregator_label(applied_offer)
+            if offer_site != "Booking.com":
                 flight_bit = number or (flight.get("airline") or "this flight")
                 st.link_button(
-                    f"{flight_bit} on {where}",
+                    f"{flight_bit} on {offer_site}",
                     ota,
                     type="secondary",
                     width="stretch",
                 )
-    if number:
-        st.caption(f"Both open {origin_code} → {booking_dest} on {slots.get('departure_date')}. On the site, book {number} at {flight.get('departure_time')}.")
+    applied = net.get("offer") or {}
+    where = _aggregator_label(applied) if applied else ""
+    if where and where != "Booking.com":
+        st.caption(f"The fare is on Booking.com. {where} honours this offer. Points are an estimate.")
+    else:
+        st.caption("The fare is on Booking.com. Points are an estimate.")
 
 
 FARE_PAGE = 5
 SORT_MODES = ["Best", "Cheapest", "Fastest", "Earliest"]
 
 
-def _rank_fares(flights: list, mode: str) -> list:
+def _rank_fares(flights: list, mode: str, *, pay_of=None) -> list:
     priced = [f for f in flights if (f.get("price") or 0) > 0]
     if not priced:
         return []
@@ -2165,20 +2628,25 @@ def _rank_fares(flights: list, mode: str) -> list:
         s = f.get("stops")
         return s if s is not None else (0 if f.get("non_stop") else 1)
 
+    def amount(f: dict) -> float:
+        if pay_of is not None and mode in ("Best", "Cheapest"):
+            return pay_of(f)
+        return f["price"]
+
     if mode == "Cheapest":
-        return sorted(priced, key=lambda f: (f["price"], minutes(f)))
+        return sorted(priced, key=lambda f: (amount(f), minutes(f)))
     if mode == "Fastest":
         return sorted(priced, key=lambda f: (minutes(f), f["price"]))
     if mode == "Earliest":
         return sorted(priced, key=lambda f: (_minutes(f.get("departure_time")) or 24 * 60, f["price"]))
     if any(f.get("fit_score") is not None for f in priced):
-        return sorted(priced, key=lambda f: (-(f.get("fit_score") or 0), f["price"]))
-    low_p = min(f["price"] for f in priced)
+        return sorted(priced, key=lambda f: (-(f.get("fit_score") or 0), amount(f)))
+    low_p = min(amount(f) for f in priced) or 1
     low_m = min(minutes(f) for f in priced)
     # Price matters most; a long or broken journey has to be much cheaper to win.
     return sorted(
         priced,
-        key=lambda f: f["price"] / low_p + 0.6 * minutes(f) / low_m + 0.15 * stops(f),
+        key=lambda f: amount(f) / low_p + 0.6 * minutes(f) / low_m + 0.15 * stops(f),
     )
 
 
@@ -2198,7 +2666,16 @@ def _render_fare_list(flights: list) -> None:
             "Sort fares", SORT_MODES, key="fare_sort", label_visibility="collapsed",
         ) or st.session_state.fare_sort
 
-    ranked = _rank_fares(flights, mode)
+    you_pay_on = _wallet_applies(flights)
+    nets: dict = {}
+
+    def pay_of(flight: dict) -> float:
+        key = id(flight)
+        if key not in nets:
+            nets[key] = _flight_net(flight)
+        return float(nets[key].get("you_pay") if nets[key].get("you_pay") is not None else flight.get("price") or 0)
+
+    ranked = _rank_fares(flights, mode, pay_of=pay_of if you_pay_on else None)
     shown = ranked[: st.session_state.fares_shown]
     for i, f in enumerate(shown):
         number = str(f.get("flight_number") or "").strip()
@@ -2213,7 +2690,6 @@ def _render_fare_list(flights: list) -> None:
             extra.append(f"{format_flight_price(cut)} off")
         if deal:
             extra.append(deal)
-        extra.append("Booking.com")
         sub = " · ".join(p for p in (_duration_label(f), _stops_label(f), cabin, score_bit, *extra) if p)
         with st.container(key=f"farerow{i}"):
             info, price_col, act = st.columns(FARE_COLS, vertical_alignment="center")
@@ -2228,7 +2704,8 @@ def _render_fare_list(flights: list) -> None:
                     unsafe_allow_html=True,
                 )
             with price_col:
-                st.markdown(_price_stack(f), unsafe_allow_html=True)
+                net = nets.get(id(f)) or (_flight_net(f) if you_pay_on else None)
+                st.markdown(_price_stack(f, net, you_pay_on=you_pay_on), unsafe_allow_html=True)
             with act:
                 if st.button("Book", key=f"choose_fare_{i}", type="tertiary"):
                     st.session_state.selected_flight = dict(f)
@@ -2317,7 +2794,7 @@ def _render_card_picks() -> None:
     saving = top.get("saving")
     gain = f"about ₹{float(saving):,.0f} off" if saving else "a live discount"
     where = _aggregator_label({"merchant": top.get("merchant")}) if top.get("merchant") else "the booking site"
-    with st.expander(f"{top['card_name']} · {gain} on {where}", expanded=False):
+    with st.expander(f"{gain} with {top['card_name']} on {where}", expanded=False):
         st.markdown('<div class="gx-picks">' + "".join(rows) + "</div>", unsafe_allow_html=True)
 
 
@@ -2375,6 +2852,754 @@ def _render_search_offers(flights: list) -> None:
                     st.link_button("Terms", ref, type="tertiary")
 
 
+CARD_TONE = {
+    "amex-mr": "#2E6BFF",
+    "axis-olympus": "#1C1C1C",
+    "axis-atlas": "#8B1E3F",
+    "axis-horizon": "#0E6B4F",
+    "axis-magnus": "#C4A35A",
+    "hdfc-infinia": "#004B8D",
+    "hdfc-diners-black": "#111111",
+    "hdfc-regalia-gold": "#B8860B",
+    "hsbc-travelone": "#DB0011",
+}
+
+
+def _parse_plan_date(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _refresh_plan() -> None:
+    """Dates and cabin are the search. Cards and points only change what you pay."""
+    depart = _parse_plan_date(st.session_state.get("plan_depart"))
+    cabin_label = st.session_state.get("plan_cabin") or "Economy"
+    cabin = "business" if str(cabin_label).lower().startswith("bus") else "economy"
+    ret = _parse_plan_date(st.session_state.get("plan_return")) if st.session_state.get("plan_round") else None
+    if not depart:
+        return
+    if ret and ret < depart:
+        st.session_state.plan_note = "Return is after departure."
+        return
+    slots = dict(st.session_state.get("slots") or {})
+    slots["departure_date"] = depart.isoformat()
+    slots["return_date"] = ret.isoformat() if ret else None
+    slots["trip_type"] = "round_trip" if ret else "one_way"
+    slots["cabin_class"] = cabin
+    st.session_state.slots = slots
+    st.session_state.plan_note = ""
+    if st.session_state.get("staging"):
+        st.session_state.last_search_results = staging_flights(slots)
+        st.session_state.last_search_params = slots
+        st.session_state.selected_flight = None
+        return
+    try:
+        flights, api_error, _details = search_flights_api(slots, max_results=15)
+    except Exception as exc:
+        logger.warning("plan refresh failed: %s", exc)
+        st.session_state.plan_note = "The fare search did not answer. Try the date again."
+        return
+    if api_error and not flights:
+        st.session_state.plan_note = str(api_error)
+        return
+    st.session_state.last_search_results = flights or []
+    st.session_state.last_search_params = slots
+    st.session_state.selected_flight = None
+    st.session_state.fares_shown = FARE_PAGE
+
+
+def _wallet_result(transfer: dict | None, airline: str) -> str:
+    if not transfer:
+        return ""
+    program = transfer.get("program_name") or "that program"
+    if not transfer.get("matches_airline"):
+        who = transfer.get("card_name") or "This card"
+        return f"{who} has no {program} route on {airline or 'this airline'}"
+    try:
+        received = int(float(transfer.get("received") or 0))
+    except (TypeError, ValueError):
+        received = 0
+    try:
+        value = float(transfer.get("value_inr") or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    who = transfer.get("card_name") or ""
+    bits = [p for p in (who, f"{received:,} {program}") if p]
+    if value > 0:
+        bits.append(f"{_inr(value)} off")
+    return " · ".join(bits)
+
+
+def _render_plan(flights: list, *, show: str = "both") -> None:
+    """Bolt's plan bar: route, cabin, dates, then a card you tap and a point balance."""
+    slots = st.session_state.get("slots") or {}
+    origin = (slots.get("origin") or {}).get("city") or (slots.get("origin") or {}).get("airport_code") or ""
+    dest = (slots.get("destination") or {}).get("city") or (slots.get("destination") or {}).get("airport_code") or ""
+    route = " → ".join(p for p in (str(origin), str(dest)) if p) or "This route"
+    depart = _parse_plan_date(slots.get("departure_date")) or date.today()
+    ret = _parse_plan_date(slots.get("return_date"))
+    cabin = str(slots.get("cabin_class") or "economy").lower()
+    if "plan_depart" not in st.session_state:
+        st.session_state.plan_depart = depart
+    if "plan_return" not in st.session_state:
+        st.session_state.plan_return = ret or depart
+    if "plan_round" not in st.session_state:
+        st.session_state.plan_round = bool(ret)
+    if "plan_cabin" not in st.session_state:
+        st.session_state.plan_cabin = "Business" if "bus" in cabin else "Economy"
+    if "wallet_points" not in st.session_state:
+        st.session_state.wallet_points = 0
+    if "wallet_card_id" not in st.session_state:
+        st.session_state.wallet_card_id = None
+    # The airline on each fare picks the transfer. A pinned program fought that.
+    st.session_state.wallet_program_id = None
+
+    floor = min(depart, date.today())
+    if show in ("trip", "both"):
+        _render_plan_dates(route, flights, floor)
+    if show == "trip":
+        return
+    _render_plan_cards(flights)
+
+
+def _render_plan_dates(route: str, flights: list, floor) -> None:
+    with st.container(key="planbar"):
+        route_col, cabin_col, dep_col, ret_col = st.columns([1.5, 1.35, 1.05, 1.15], vertical_alignment="bottom")
+        with route_col:
+            st.markdown(f'<div class="gx-plan-route">{html.escape(route)}</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="gx-plan-meta">{len(flights)} fares</div>',
+                unsafe_allow_html=True,
+            )
+        with cabin_col:
+            st.segmented_control(
+                "Cabin",
+                ["Economy", "Business"],
+                key="plan_cabin",
+                on_change=_refresh_plan,
+                label_visibility="collapsed",
+            )
+        with dep_col:
+            st.date_input(
+                "Depart",
+                key="plan_depart",
+                min_value=floor,
+                format="DD/MM/YYYY",
+                on_change=_refresh_plan,
+            )
+        with ret_col:
+            st.checkbox("Return", key="plan_round", on_change=_refresh_plan)
+            if st.session_state.get("plan_round"):
+                st.date_input(
+                    "Return date",
+                    key="plan_return",
+                    min_value=_parse_plan_date(st.session_state.get("plan_depart")) or floor,
+                    format="DD/MM/YYYY",
+                    on_change=_refresh_plan,
+                    label_visibility="collapsed",
+                )
+    if st.session_state.get("plan_note"):
+        st.caption(st.session_state.plan_note)
+
+
+def _render_plan_cards(flights: list) -> None:
+    cards = _wallet_cards_safe()
+    held_id = _wallet_card_id()
+    held = _wallet_card_row()
+    if held:
+        tone = CARD_TONE.get(held_id, "#4A453E")
+        with st.container(key="heldcard"):
+            mark, body, pts, clear = st.columns([0.35, 2.4, 1.3, 0.7], vertical_alignment="center")
+            with mark:
+                st.markdown(
+                    f'<div class="gx-swatch" style="background:{tone}"></div>',
+                    unsafe_allow_html=True,
+                )
+            with body:
+                st.markdown(
+                    f'<div class="gx-held-name">{html.escape(held.get("name") or "")}</div>'
+                    f'<div class="gx-held-bank">{html.escape(held.get("bank") or "")}'
+                    f' · {html.escape(held.get("currency") or "points")}</div>',
+                    unsafe_allow_html=True,
+                )
+            with pts:
+                st.number_input(
+                    "Point balance",
+                    min_value=0,
+                    step=1,
+                    key="wallet_points",
+                )
+            with clear:
+                if st.button("Change", key="clear_held_card"):
+                    st.session_state.wallet_card_id = None
+                    st.rerun()
+    else:
+        st.markdown('<div class="gx-plan-k">Add a card you hold</div>', unsafe_allow_html=True)
+        rules = []
+        for card in cards:
+            safe = str(card["id"]).replace("-", "_")
+            tone = CARD_TONE.get(card["id"], "#4A453E")
+            rules.append(
+                f'.st-key-add_{safe} button{{position:relative;padding-left:42px !important;text-align:left}}'
+                f'.st-key-add_{safe} button::before{{content:"";position:absolute;left:14px;top:50%;'
+                f'width:14px;height:14px;margin-top:-7px;border-radius:4px;background:{tone}}}'
+            )
+        if rules:
+            st.markdown("<style>" + "".join(rules) + "</style>", unsafe_allow_html=True)
+        with st.container(key="cardpick"):
+            left, right = st.columns(2)
+            for index, card in enumerate(cards):
+                safe = str(card["id"]).replace("-", "_")
+                column = left if index % 2 == 0 else right
+                with column:
+                    if st.button(
+                        f'{card["name"]}  ·  {card["bank"]}',
+                        key=f"add_{safe}",
+                        use_container_width=True,
+                    ):
+                        st.session_state.wallet_card_id = card["id"]
+                        st.rerun()
+
+    if held and _wallet_points() > 0:
+        priced = [f for f in flights or [] if (f.get("price") or 0) > 0]
+        sample = min(priced, key=lambda f: f["price"]) if priced else {}
+        airline = str(sample.get("airline") or "")
+        net = _flight_net(sample) if sample else {}
+        line = _wallet_result(net.get("transfer"), airline)
+        if line:
+            st.markdown(f'<div class="gx-xfer">{html.escape(line)}</div>', unsafe_allow_html=True)
+
+
+def _render_steps(current: str) -> None:
+    order = [("trip", "Destination"), ("cards", "Cards"), ("price", "Price")]
+    here = next((i for i, (key, _) in enumerate(order) if key == current), 0)
+    parts = []
+    for index, (_key, label) in enumerate(order):
+        state = "on" if index == here else ("done" if index < here else "")
+        parts.append(f'<span class="{state}"><i></i>{html.escape(label)}</span>')
+    st.markdown(f'<div class="gx-steps">{"".join(parts)}</div>', unsafe_allow_html=True)
+
+
+def _stage_line(title: str, sub: str) -> None:
+    st.markdown(
+        f'<h2 class="gx-stage">{html.escape(title)}</h2>'
+        f'<p class="gx-stage-sub">{html.escape(sub)}</p>',
+        unsafe_allow_html=True,
+    )
+
+
+def _go_step(step: str) -> None:
+    st.session_state.desk_step = step
+    st.rerun()
+
+
+def _trip_when(slots: dict) -> tuple[str, str, str]:
+    dest = (slots.get("destination") or {})
+    city = dest.get("city") or dest.get("airport_code") or "This trip"
+    cabin = "Business" if "bus" in str(slots.get("cabin_class") or "").lower() else "Economy"
+    raw = str(slots.get("departure_date") or "")
+    when = ""
+    try:
+        parsed = datetime.strptime(raw[:10], "%Y-%m-%d")
+        when = parsed.strftime("%b %Y")
+    except ValueError:
+        when = raw
+    return str(city), cabin, when
+
+
+def _cheapest_fare(flights: list) -> dict:
+    priced = [f for f in flights or [] if (f.get("price") or 0) > 0]
+    if not priced:
+        return {}
+    return min(priced, key=lambda f: float(f["price"]))
+
+
+def _open_fare(flight: dict) -> None:
+    if not flight:
+        return
+    st.session_state.selected_flight = dict(flight)
+    st.session_state.booking_ready_url = None
+    st.rerun()
+
+
+def _clear_pay_answer() -> None:
+    st.session_state.pay_shown = False
+
+
+def _route_offers(flight: dict) -> list:
+    if not flight:
+        return []
+    airline = str(flight.get("airline") or "")
+    try:
+        price = float(flight.get("price") or 0)
+    except (TypeError, ValueError):
+        price = 0.0
+    origin = str(flight.get("origin_code") or "")
+    dest = str(flight.get("destination_code") or "")
+    try:
+        return offers_for_fare(
+            _card_offers_cached(),
+            airline,
+            fare=price,
+            segment=route_segment(origin, dest) if origin and dest else None,
+        )
+    except Exception:
+        logger.debug("Card offers unavailable", exc_info=True)
+        return []
+
+
+def _offer_headline(offers: list, fare: float) -> str:
+    percents = []
+    best_save = 0.0
+    for offer in offers or []:
+        if offer.get("percent_off"):
+            try:
+                percents.append(float(offer["percent_off"]))
+            except (TypeError, ValueError):
+                pass
+        best_save = max(best_save, float(estimate_saving(offer, fare) or 0))
+    if percents:
+        return f"Up to {max(percents):g}% off"
+    if best_save > 0:
+        return f"Up to {_inr(best_save)} off"
+    return ""
+
+
+def _offer_meta(offer: dict) -> str:
+    title = _short_offer_title(offer.get("title") or "")
+    where = _aggregator_label(offer)
+    bits = [html.escape(part) for part in (title, where) if part]
+    ref = offer.get("detail_url") or offer.get("terms_url") or ""
+    if ref:
+        bits.append(
+            f'<a class="gx-ref" href="{html.escape(ref)}" target="_blank" rel="noopener">Terms</a>'
+        )
+    return " · ".join(bits)
+
+
+def _points_cut(card: dict | None, airline: str, points: int, room: float) -> tuple[float, str]:
+    """Published rupees per point, or a partner route that matches this airline."""
+    if not card or points <= 0 or room <= 0:
+        return 0.0, ""
+    rate_line = _rate_text(card.get("inr_per_point"))
+    if rate_line:
+        value = min(room, points * float(card["inr_per_point"]))
+        return value, f"{points:,} points"
+    known = {row.get("id") for row in _wallet_cards_safe()}
+    if card.get("id") not in known:
+        return 0.0, ""
+    transfer = best_transfer(card["id"], airline, points)
+    if not transfer or not transfer.get("matches_airline"):
+        return 0.0, ""
+    value = min(room, float(transfer.get("value_inr") or 0))
+    return value, html.escape(_transfer_line(transfer))
+
+
+def _render_pay_desk(flights: list) -> None:
+    """The page after the cover: how you pay, then what you actually pay."""
+    slots = st.session_state.get("slots") or {}
+    city, cabin, when = _trip_when(slots)
+    fare = _cheapest_fare(flights)
+    cash = float(fare.get("price") or 0)
+    if "pay_path" not in st.session_state:
+        st.session_state.pay_path = "I have points"
+    if "pay_points" not in st.session_state:
+        st.session_state.pay_points = int(st.session_state.get("wallet_points") or 0)
+    cards = _pay_cards_cached()
+    labels = [_pay_card_label(c) for c in cards]
+    if labels and st.session_state.get("pay_card") not in labels:
+        st.session_state.pay_card = labels[0]
+    shown = bool(st.session_state.get("pay_shown"))
+    st.markdown(
+        """
+        <style>
+          .st-key-sheet:has(.gx-pay) [data-testid="stButton"] button[kind="primary"] {
+            background: #fff !important; color: #1C1C1C !important;
+            border: 1px solid #E4E2DC !important; border-radius: 999px !important;
+            font-weight: 600 !important; min-height: 38px;
+          }
+          .gx-pay-step { font-size: 0.72rem; letter-spacing: 0.14em; font-weight: 700; color: #8C8A84; margin: 0.4rem 0 0.8rem; }
+          .gx-pay-h { font-size: clamp(2.4rem, 4vw, 3.4rem); line-height: 0.98; letter-spacing: -0.045em; font-weight: 750; color: #161616; margin: 0; }
+          .gx-pay-h em { display: block; font-style: normal; color: #F5C400; }
+          .gx-pay-lead { max-width: 28rem; margin: 1rem 0 1.4rem; color: #5E5C57; font-size: 1rem; line-height: 1.45; }
+          .gx-trip-pill { background: #E7EFE6; border-radius: 18px; padding: 0.95rem 1rem 1rem; max-width: 22rem; }
+          .gx-trip-pill .k { font-size: 0.68rem; letter-spacing: 0.12em; font-weight: 700; color: #7D8A7C; }
+          .gx-trip-pill .c { margin-top: 0.35rem; font-size: 1.35rem; font-weight: 750; color: #1C1C1C; }
+          .gx-trip-pill .m { color: #6D7A6C; font-size: 0.92rem; }
+          .st-key-paycard {
+            background: #fff; border: 1px solid #ECEAE4; border-radius: 28px;
+            padding: 0.85rem 0.9rem 1.1rem; box-shadow: 0 10px 30px rgba(20,20,20,0.04);
+          }
+          .st-key-paybody { min-height: 15.5rem; }
+          .gx-offer-chip { color: #178A45; font-weight: 750; margin: 1rem 0 0.15rem; font-size: 1rem; }
+          .gx-offer-scroll {
+            max-height: 14.5rem;
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            padding-right: 0.35rem;
+            margin: 0.1rem 0 0.2rem;
+            scrollbar-gutter: stable;
+          }
+          .gx-offer-scroll::-webkit-scrollbar { width: 6px; }
+          .gx-offer-scroll::-webkit-scrollbar-thumb {
+            background: #C9C4BA; border-radius: 999px;
+          }
+          .gx-offer-scroll::-webkit-scrollbar-track { background: transparent; }
+          .gx-pay-sheet { background: #fff; border: 1px solid #ECEAE4; border-radius: 18px; padding: 0.35rem 1rem 0.2rem; margin: 0.4rem 0 0.8rem; }
+          .gx-pay-sheet .gx-receipt-row { border-top-color: #ECEAE4; }
+          .gx-pay-sheet .gx-receipt-name { font-size: 0.95rem; }
+          .gx-pay-sheet .gx-receipt-amt { font-size: 1.15rem; }
+          .st-key-paycard [data-testid="stButtonGroup"] { width: 100%; background: #F3F1EC; border-radius: 14px; padding: 4px; }
+          .st-key-paycard [data-testid="stButtonGroup"] button { border: 0 !important; border-radius: 11px !important; background: transparent !important; color: #6E6C66 !important; font-weight: 600 !important; }
+          .st-key-paycard [data-testid="stButtonGroup"] button[kind*="Active"] { background: #fff !important; color: #1C1C1C !important; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
+          .gx-pay-k { font-size: 0.72rem; letter-spacing: 0.08em; font-weight: 700; color: #8A8882; margin: 0.85rem 0 0.35rem; }
+          .gx-pay-title { font-size: 1.15rem; font-weight: 750; color: #1C1C1C; margin: 0.2rem 0 0.15rem; }
+          .gx-pay-copy { color: #6E6C66; font-size: 0.92rem; line-height: 1.4; margin-bottom: 0.4rem; }
+          .st-key-paygo button {
+            width: 100%; background: #1B1E22 !important; color: #fff !important;
+            border: 0 !important; border-radius: 12px !important; min-height: 52px;
+            font-weight: 650 !important; font-size: 1rem !important;
+          }
+          .gx-note-line { text-align: center; color: #8C8A84; font-size: 0.82rem; margin-top: 0.75rem; }
+          .gx-ans-k { font-size: 0.72rem; letter-spacing: 0.12em; font-weight: 700; color: #8C8A84; }
+          .gx-ans-h { font-size: clamp(2rem, 3vw, 2.6rem); font-weight: 750; letter-spacing: -0.04em; color: #161616; margin: 0.2rem 0; }
+          .gx-ans-sub { color: #6E6C66; margin-bottom: 1rem; }
+          .gx-save { background: #E7F6EC; color: #1E7A45; border-radius: 16px; padding: 0.7rem 0.9rem 0.75rem; text-align: right; }
+          .gx-save b { display: block; font-size: 1.35rem; color: #178A45; }
+          .gx-save span { font-size: 0.68rem; letter-spacing: 0.08em; font-weight: 700; }
+          .gx-base, .gx-deal, .gx-alt, .gx-worth {
+            background: #fff; border: 1px solid #ECEAE4; border-radius: 18px;
+            padding: 0.95rem 1rem 0.85rem; margin: 0.7rem 0;
+          }
+          .gx-base { display: flex; justify-content: space-between; align-items: center; }
+          .gx-base .p, .gx-deal .pay b, .gx-worth b { font-size: 1.45rem; font-weight: 750; }
+          .gx-linkish { color: #E07A2F !important; font-weight: 650; background: transparent !important; border: 0 !important; padding: 0 !important; min-height: 0 !important; }
+          .gx-deal { background: #F3FBF4; border-color: #D7EEDB; }
+          .gx-deal .n, .gx-alt .n { display: inline-flex; width: 1.4rem; height: 1.4rem; border-radius: 999px; background: #E7F6EC; color: #1E7A45; font-weight: 750; align-items: center; justify-content: center; margin-right: 0.4rem; }
+          .gx-tag { display: inline-block; background: #E7F6EC; color: #1E7A45; border-radius: 999px; font-size: 0.68rem; font-weight: 750; letter-spacing: 0.06em; padding: 0.15rem 0.45rem; }
+          .gx-metrics { display: flex; gap: 1.4rem; margin-top: 0.7rem; }
+          .gx-metrics span { display: block; font-size: 0.68rem; letter-spacing: 0.06em; color: #8C8A84; font-weight: 700; }
+          .gx-worth { background: #FFF8E6; border-color: #F3E2A8; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    if not shown:
+        route_offers = _route_offers(fare)
+        headline = _offer_headline(route_offers, cash)
+        left, right = st.columns([1.05, 0.95], vertical_alignment="top")
+        with left:
+            st.markdown(
+                '<div class="gx-pay-step">STEP 2 OF 2</div>'
+                '<h2 class="gx-pay-h">Tell me how<br><em>you want to pay.</em></h2>'
+                '<p class="gx-pay-lead">I’ll show the cash fare either way, then compare '
+                "points or recommend a card if that could lower the price.</p>"
+                '<div class="gx-trip-pill"><div class="k">YOUR TRIP</div>'
+                f'<div class="c">{html.escape(city)}</div>'
+                f'<div class="m">{html.escape(cabin)} · {html.escape(when)}</div></div>',
+                unsafe_allow_html=True,
+            )
+            if headline:
+                st.markdown(
+                    f'<p class="gx-offer-chip">{html.escape(headline)} with card offers</p>',
+                    unsafe_allow_html=True,
+                )
+                with st.expander("See the offers", expanded=False):
+                    _render_offer_list(route_offers, cash)
+            _render_price_alert(fare, cash)
+        with right:
+            with st.container(key="paycard"):
+                st.segmented_control(
+                    "How to pay",
+                    ["I have points", "I'll pay cash", "Find a card"],
+                    key="pay_path",
+                    on_change=_clear_pay_answer,
+                    label_visibility="collapsed",
+                )
+                path = st.session_state.get("pay_path") or "I have points"
+                with st.container(key="paybody"):
+                    if path == "I have points":
+                        st.markdown(
+                            '<div class="gx-pay-title">Your points balance</div>'
+                            '<p class="gx-pay-copy">Choose the card that holds your travel points.</p>'
+                            '<div class="gx-pay-k">CREDIT CARD</div>',
+                            unsafe_allow_html=True,
+                        )
+                        st.selectbox("Credit card", labels or ["No cards loaded"], key="pay_card", label_visibility="collapsed")
+                        st.markdown('<div class="gx-pay-k">AVAILABLE POINTS</div>', unsafe_allow_html=True)
+                        st.number_input("Available points", min_value=0, step=1000, key="pay_points", label_visibility="collapsed")
+                        cta = "Compare my points"
+                    elif path == "I'll pay cash":
+                        st.markdown(
+                            '<div class="gx-pay-title">Show me the cash fare</div>'
+                            '<p class="gx-pay-copy">I’ll use the fare for this route as your baseline '
+                            "and show booking options.</p>",
+                            unsafe_allow_html=True,
+                        )
+                        cta = "Show cash fares"
+                    else:
+                        st.markdown(
+                            '<div class="gx-pay-title">Find the best card for this trip</div>'
+                            '<p class="gx-pay-copy">I’ll show the cash fare first, then surface a card '
+                            "whose points or offer could make this route cheaper.</p>",
+                            unsafe_allow_html=True,
+                        )
+                        cta = "Show card opportunities"
+                with st.container(key="paygo"):
+                    go = st.button(f"{cta}  →", key="pay_continue", use_container_width=True)
+                st.markdown(
+                    '<p class="gx-note-line">Estimates only. Always verify availability.</p>',
+                    unsafe_allow_html=True,
+                )
+        if go:
+            label = st.session_state.get("pay_card") or ""
+            chosen = next((c for c in cards if _pay_card_label(c) == label), None)
+            if path == "I have points" and chosen:
+                st.session_state.wallet_card_id = chosen["id"]
+                st.session_state.wallet_points = int(st.session_state.get("pay_points") or 0)
+            elif path != "I have points":
+                st.session_state.wallet_card_id = None
+            st.session_state.pay_shown = True
+            st.rerun()
+        return
+
+    path = st.session_state.get("pay_path") or "I have points"
+    points = int(st.session_state.get("pay_points") or 0)
+    card = _wallet_card_row() if path == "I have points" else None
+    airline = str(fare.get("airline") or "")
+    route_offers = _route_offers(fare)
+    applied = _offer_for_wallet(route_offers, card) if card else None
+    if applied is None and route_offers:
+        applied = max(route_offers, key=lambda offer: float(estimate_saving(offer, cash) or 0))
+        if not estimate_saving(applied, cash):
+            applied = None
+    offer_saving = float(estimate_saving(applied, cash) or 0) if applied else 0.0
+    room = max(0.0, cash - offer_saving)
+    points_value, points_meta = (0.0, "")
+    if path == "I have points":
+        points_value, points_meta = _points_cut(card, airline, points, room)
+    you_pay = max(0.0, cash - offer_saving - points_value)
+    saved = max(0.0, cash - you_pay)
+    priced = [row for row in cards if row.get("inr_per_point")]
+    suggest = max(priced, key=lambda row: float(row["inr_per_point"])) if path == "Find a card" and priced else None
+    head_l, head_r = st.columns([2.4, 1], vertical_alignment="center")
+    with head_l:
+        st.markdown(
+            '<div class="gx-ans-k">YOUR ANSWER</div>'
+            '<h2 class="gx-ans-h">What you’ll actually pay</h2>'
+            '<p class="gx-ans-sub">Cash fare, then the card offer on '
+            + html.escape(airline or "this airline")
+            + (
+                ", then your points."
+                if path == "I have points"
+                else ", then a card with a published point value."
+                if path == "Find a card"
+                else "."
+            )
+            + "</p>",
+            unsafe_allow_html=True,
+        )
+    with head_r:
+        if saved > 0:
+            st.markdown(
+                '<div class="gx-save"><span>BEST OPTION SAVES</span>'
+                f"<b>{html.escape(_inr(saved))}</b></div>",
+                unsafe_allow_html=True,
+            )
+    rows = [
+        _receipt_row("Cash fare", _inr(cash), f"Pay cash on {airline}" if airline else "Pay cash"),
+    ]
+    if applied and offer_saving > 0:
+        rows.append(
+            _receipt_row(
+                applied.get("bank") or "Card offer",
+                f"− {_inr(offer_saving)}",
+                _offer_meta(applied),
+                kind="save",
+                raw_meta=True,
+            )
+        )
+    if points_meta and points_value > 0:
+        rows.append(_receipt_row("Points", f"− {_inr(points_value)}", points_meta, kind="save", raw_meta=True))
+    if suggest:
+        link = ""
+        if suggest.get("source_url"):
+            link = (
+                f' · <a class="gx-ref" href="{html.escape(suggest["source_url"])}" '
+                'target="_blank" rel="noopener">Card page</a>'
+            )
+        rows.append(
+            _receipt_row(
+                suggest["name"],
+                "",
+                f'{html.escape(suggest.get("bank") or "")}{link}',
+                raw_meta=True,
+            )
+        )
+    rows.append(_receipt_row("You pay", _inr(you_pay), kind="pay"))
+    st.markdown(f'<div class="gx-pay-sheet">{"".join(rows)}</div>', unsafe_allow_html=True)
+    st.markdown('<div class="gx-pay-k">FLIGHTS</div>', unsafe_allow_html=True)
+    ranked = sorted(
+        [row for row in flights if (row.get("price") or 0) > 0],
+        key=lambda row: float(row["price"]),
+    )
+    for idx, flight in enumerate(ranked):
+        flight_cash = float(flight.get("price") or 0)
+        flight_offers = _route_offers(flight)
+        flight_offer = _offer_for_wallet(flight_offers, card) if card else None
+        if flight_offer is None and flight_offers:
+            flight_offer = max(flight_offers, key=lambda offer: float(estimate_saving(offer, flight_cash) or 0))
+            if not estimate_saving(flight_offer, flight_cash):
+                flight_offer = None
+        flight_save = float(estimate_saving(flight_offer, flight_cash) or 0) if flight_offer else 0.0
+        flight_points = 0.0
+        if path == "I have points":
+            flight_points, _meta = _points_cut(card, str(flight.get("airline") or ""), points, max(0.0, flight_cash - flight_save))
+        flight_pay = max(0.0, flight_cash - flight_save - flight_points)
+        info, act = st.columns([5, 1], vertical_alignment="center")
+        with info:
+            st.markdown(
+                _ticket_html(flight, {"cash": flight_cash, "you_pay": flight_pay}, you_pay_on=True),
+                unsafe_allow_html=True,
+            )
+        with act:
+            if st.button("Book", key=f"book_opt_{idx}", use_container_width=True):
+                _open_fare(flight)
+    if route_offers:
+        with st.expander(f"Card offers on {airline or 'this airline'}", expanded=False):
+            _render_offer_list(route_offers, cash)
+    _render_price_alert(fare, cash)
+
+
+def _render_price_alert(fare: dict, cash: float) -> None:
+    """Card matching the mock: target ₹ + email → price_alerts table."""
+    slots = st.session_state.get("slots") or {}
+    origin = ((slots.get("origin") or {}).get("airport_code") or fare.get("origin_code") or "").upper()
+    dest = ((slots.get("destination") or {}).get("airport_code") or fare.get("destination_code") or "").upper()
+    depart = str(slots.get("departure_date") or fare.get("departure_date") or "")[:10]
+    cabin = str(slots.get("cabin_class") or "economy")
+    if not (origin and dest and depart):
+        return
+
+    default_target = int(max(1000, round((cash or 0) * 0.9 / 100) * 100)) if cash else 0
+    if "alert_target" not in st.session_state:
+        st.session_state.alert_target = default_target
+    if "alert_email" not in st.session_state:
+        st.session_state.alert_email = ""
+
+    st.markdown(
+        """
+        <style>
+          .st-key-pricealert {
+            background: #fff; border: 1px solid #E8E6E1; border-radius: 22px;
+            padding: 1.15rem 1.2rem 1.25rem; margin: 1.1rem 0 0.4rem;
+            box-shadow: 0 8px 24px rgba(20,20,20,0.04); max-width: 26rem;
+          }
+          .gx-alert-head { display:flex; gap:0.75rem; align-items:flex-start; margin-bottom:0.95rem; }
+          .gx-alert-bell {
+            width:2.1rem; height:2.1rem; border-radius:999px; background:#E7F0E8;
+            display:flex; align-items:center; justify-content:center; flex:none;
+          }
+          .gx-alert-bell svg { width:1.05rem; height:1.05rem; stroke:#2F6B45; fill:none; stroke-width:1.8; }
+          .gx-alert-head b { display:block; font-size:1.05rem; font-weight:750; color:#1C1C1C; }
+          .gx-alert-head p { margin:0.2rem 0 0; color:#6E6C66; font-size:0.88rem; line-height:1.35; }
+          .st-key-pricealert .gx-pay-k { margin-top:0; }
+          .st-key-pricealert [data-testid="stNumberInput"] [data-baseweb="input"],
+          .st-key-pricealert [data-testid="stTextInput"] [data-baseweb="input"] {
+            border:1px solid #E4E2DC !important; border-radius:14px !important;
+            background:#FAFAF8 !important; min-height:48px !important;
+          }
+          .st-key-pricealert [data-testid="stNumberInput"] input,
+          .st-key-pricealert [data-testid="stTextInput"] input {
+            font-weight:650 !important; font-size:1.05rem !important;
+          }
+          .st-key-pricealert [data-testid="stNumberInput"] button { display:none !important; }
+          .st-key-alertgo button {
+            width:100%; background:#fff !important; color:#3D7A52 !important;
+            border:1.5px solid #A8C4B0 !important; border-radius:14px !important;
+            min-height:48px; font-weight:700 !important;
+          }
+          .st-key-alertgo button:disabled {
+            color:#9AA89E !important; border-color:#D5DFD8 !important; opacity:1 !important;
+          }
+          .gx-alert-ok { color:#1E7A45; font-size:0.88rem; margin-top:0.55rem; }
+          .gx-alert-err { color:#B42318; font-size:0.88rem; margin-top:0.55rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.container(key="pricealert"):
+        st.markdown(
+            '<div class="gx-alert-head">'
+            '<div class="gx-alert-bell">'
+            '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2c0 .5-.2 1-.6 1.4L4 17h5"/>'
+            '<path d="M9.5 17a2.5 2.5 0 0 0 5 0"/></svg></div>'
+            "<div><b>Set a price alert</b>"
+            "<p>We’ll email you if this trip reaches your target or drops below it.</p>"
+            "</div></div>"
+            '<div class="gx-pay-k">ALERT ME AT</div>',
+            unsafe_allow_html=True,
+        )
+        # Show ₹ prefix beside the number field
+        cur, amt = st.columns([0.35, 3.65], vertical_alignment="center")
+        with cur:
+            st.markdown(
+                '<div style="font-weight:700;font-size:1.15rem;color:#6E6C66;padding:0.55rem 0 0 0.2rem">₹</div>',
+                unsafe_allow_html=True,
+            )
+        with amt:
+            target = st.number_input(
+                "Target price (₹)",
+                min_value=0,
+                step=500,
+                key="alert_target",
+                label_visibility="collapsed",
+            )
+        email = st.text_input(
+            "Email",
+            placeholder="you@example.com",
+            key="alert_email",
+            label_visibility="collapsed",
+        )
+        ready = bool(target and target > 0 and "@" in (email or "") and "." in (email or "").split("@")[-1])
+        with st.container(key="alertgo"):
+            saved = st.button("Save price alert", disabled=not ready, use_container_width=True)
+        if saved and ready:
+            from src.services.supabase_persistence import insert_price_alert
+
+            row = insert_price_alert({
+                "email": email,
+                "origin": origin,
+                "destination": dest,
+                "depart_date": depart,
+                "return_date": slots.get("return_date") or None,
+                "cabin_class": cabin,
+                "target_price": float(target),
+                "baseline_price": float(cash) if cash else None,
+                "currency": "INR",
+            })
+            if row:
+                st.markdown(
+                    f'<p class="gx-alert-ok">Alert saved for {html.escape(origin)}→{html.escape(dest)} '
+                    f'at ₹{float(target):,.0f}. We’ll watch this route.</p>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<p class="gx-alert-err">Could not save the alert. Check Supabase '
+                    "(run docs/supabase_price_alerts_schema.sql) and try again.</p>",
+                    unsafe_allow_html=True,
+                )
+
+
 def _render_trip_board() -> None:
     slots = st.session_state.get("slots") or {}
     flights = st.session_state.get("last_search_results") or []
@@ -2394,24 +3619,8 @@ def _render_trip_board() -> None:
             _render_route_experience(slots, dest_code=dest_code)
         return
 
-    date = slots.get("departure_date")
-    ret = slots.get("return_date")
-    when = date or "Dates still open"
-    if ret:
-        when = f"{date} → {ret}"
-    st.markdown(
-        f'<div class="gx-section">Fares <span class="gx-count">{len(flights)}</span></div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        f'<div class="gx-note">{html.escape(_route_label(slots))} · {html.escape(str(when))} · prices from Booking.com</div>',
-        unsafe_allow_html=True,
-    )
-    _render_fare_list(flights)
-    _render_search_offers(flights)
-    _render_card_picks()
-    if origin and dest:
-        _render_route_experience(slots, dest_code=dest_code)
+    place = " to ".join(p for p in (str(origin or ""), str(dest or "")) if p) or "This trip"
+    _render_pay_desk(flights)
 
 
 def _place_label(slots: dict, key: str) -> str:
@@ -2534,8 +3743,8 @@ def _layout_for(photo_url: str) -> None:
             z-index: 0;
             background:
               linear-gradient(180deg,
-                rgba(8,6,4,0.55) 0%,
-                rgba(8,6,4,0.22) 38%,
+                rgba(8,6,4,0.58) 0%,
+                rgba(8,6,4,0.46) 40%,
                 rgba(8,6,4,0.62) 100%),
               url("{safe_photo}") center 42% / cover no-repeat;
             transform: scale(1.035);
@@ -2547,7 +3756,11 @@ def _layout_for(photo_url: str) -> None:
             justify-content: center !important;
             align-items: center !important;
           }}
-          .st-key-cover > div {{ width: 100%; }}
+          .st-key-cover > div {{
+            position: relative;
+            z-index: 2;
+            width: 100%;
+          }}
           .st-key-cover [data-testid="stVerticalBlock"] {{
             position: relative;
             z-index: 1;
@@ -2555,7 +3768,7 @@ def _layout_for(photo_url: str) -> None:
             gap: 0 !important;
             padding: 0 1.25rem 7vh !important;
           }}
-          .st-key-cover .element-container {{
+          .st-key-cover .element-container:not(.st-key-homebar) {{
             width: min(980px, 94vw) !important;
             margin-left: auto !important;
             margin-right: auto !important;
@@ -2566,12 +3779,22 @@ def _layout_for(photo_url: str) -> None:
             inset: 0;
             z-index: 0;
             pointer-events: none;
-            background: radial-gradient(ellipse 62% 48% at 50% 46%, rgba(8,6,4,0.46), rgba(8,6,4,0) 100%);
+            background: radial-gradient(ellipse 76% 30% at 50% 44%, rgba(6,4,2,0.82), rgba(6,4,2,0.4) 52%, rgba(6,4,2,0) 78%);
           }}
           .gx-cover-copy {{
+            display: flex;
+            flex-direction: column;
+            align-items: center;
             text-align: center;
             color: #fff !important;
-            padding: 0 0.5rem;
+            padding: 0 1rem;
+            gap: 0;
+          }}
+          .gx-cover-copy p {{
+            margin: 0 !important;
+          }}
+          .gx-cover-copy p.gx-sub {{
+            margin-top: 0.95rem !important;
           }}
           .gx-kicker {{
             display: inline-flex;
@@ -2590,24 +3813,44 @@ def _layout_for(photo_url: str) -> None:
           }}
           .gx-cover-copy h1 {{
             color: #fff !important;
-            font-size: clamp(2.15rem, 4.4vw, 3.65rem);
-            font-weight: 700;
-            letter-spacing: -0.055em;
-            margin: 0;
+            -webkit-text-fill-color: #fff !important;
+            font-size: clamp(3rem, 5.8vw, 4.6rem);
+            font-weight: 800 !important;
+            letter-spacing: -0.05em;
+            margin: 0 0 0.4rem 0 !important;
             line-height: 1.02;
             white-space: nowrap;
-            text-shadow: 0 5px 30px rgba(0,0,0,0.9);
+            -webkit-font-smoothing: auto;
+            -webkit-text-stroke: 0;
+            text-shadow: none;
             font-family: "Manrope", "Avenir Next", sans-serif !important;
           }}
-          .gx-sub {{
-            margin: 0.85rem auto 0;
-            max-width: none;
-            color: #fff !important;
-            font-size: 1.05rem;
-            font-weight: 600;
-            line-height: 1.4;
+          .gx-promise {{
+            display: block;
+            color: #F5C400 !important;
+            font-size: clamp(1.45rem, 2.6vw, 2.05rem) !important;
+            font-weight: 750;
+            letter-spacing: -0.04em;
+            line-height: 1.12 !important;
             white-space: nowrap;
-            text-shadow: 0 2px 14px rgba(0,0,0,0.95);
+            text-shadow: 0 2px 14px rgba(0,0,0,0.4);
+          }}
+          .gx-sub {{
+            max-width: 40rem;
+            margin: 0.85rem 0 0 !important;
+            color: rgba(255,255,255,0.78) !important;
+            font-size: 0.98rem !important;
+            font-weight: 500;
+            line-height: 1.4 !important;
+            letter-spacing: 0.01em;
+            white-space: nowrap;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.65), 0 8px 18px rgba(0,0,0,0.4);
+          }}
+          .gx-sub i {{
+            display: inline-block;
+            margin: 0 0.65rem;
+            color: rgba(255,255,255,0.45);
+            font-style: normal;
           }}
           .gx-split-title {{
             display: flex;
@@ -2675,45 +3918,83 @@ def _layout_for(photo_url: str) -> None:
             50% {{ transform: translateX(-50%) translateY(6px); }}
           }}
           .st-key-cover .st-key-homebar {{
-            width: min(520px, 92vw) !important;
-            margin: 1.75rem auto 0 !important;
+            width: min(560px, 92vw) !important;
+            max-width: min(560px, 92vw) !important;
+            margin: 1.65rem auto 0 !important;
+          }}
+          .st-key-cover .st-key-homebar .element-container,
+          .st-key-cover .st-key-homebar [data-testid="stVerticalBlock"],
+          .st-key-cover .st-key-homebar [data-testid="stHorizontalBlock"] {{
+            width: 100% !important;
+            max-width: 100% !important;
+            min-width: 0 !important;
           }}
           .st-key-cover .st-key-homebar [data-testid="stVerticalBlock"] {{
             min-height: 0 !important;
             padding: 0 !important;
+            align-items: stretch !important;
+            gap: 0 !important;
           }}
           .st-key-cover .st-key-homebar [data-testid="stForm"] {{
             background: transparent !important;
             border: none !important;
-            border-bottom: 1px solid rgba(255,255,255,0.55) !important;
             border-radius: 0 !important;
             box-shadow: none !important;
-            padding: 0 44px 4px 0 !important;
             position: relative;
+            height: 48px;
+            margin: 0 !important;
+            padding: 0 !important;
+            overflow: visible;
           }}
           .st-key-cover .st-key-homebar [data-testid="stHorizontalBlock"] {{
-            width: 100% !important;
+            display: flex !important;
+            flex-direction: row !important;
+            flex-wrap: nowrap !important;
+            align-items: center !important;
             gap: 0 !important;
+            height: 48px;
           }}
-          .st-key-cover .st-key-homebar [data-testid="column"]:last-child {{
+          .st-key-cover .st-key-homebar [data-testid="stColumn"]:first-child {{
+            width: calc(100% - 124px) !important;
+            max-width: calc(100% - 124px) !important;
+            min-width: 0 !important;
+            margin-left: 62px !important;
+            border-bottom: 1px solid rgba(255,255,255,0.38);
+            padding: 0 !important;
+            height: 46px;
+            align-self: center;
+          }}
+          .st-key-cover .st-key-homebar [data-testid="stColumn"]:last-child {{
             position: absolute !important;
-            right: 0;
-            top: 50%;
-            transform: translateY(-50%);
-            width: auto !important;
-            flex: 0 0 auto !important;
+            right: 0 !important;
+            top: 50% !important;
+            transform: translateY(-50%) !important;
+            width: 46px !important;
+            min-width: 46px !important;
+            max-width: 46px !important;
+            height: 46px !important;
+            flex: none !important;
+            margin: 0 !important;
+            padding: 0 !important;
           }}
           .st-key-cover .st-key-homebar [data-testid="stTextInput"] input {{
-            color: #fff !important;
-            -webkit-text-fill-color: #fff !important;
-            text-align: center;
-            font-size: 1.15rem !important;
-            font-weight: 600 !important;
+            color: rgba(255,255,255,0.72) !important;
+            -webkit-text-fill-color: rgba(255,255,255,0.72) !important;
+            text-align: center !important;
+            font-size: 0.98rem !important;
+            font-weight: 500 !important;
             background: transparent !important;
-            caret-color: #F5C400;
+            caret-color: #fff;
+            text-shadow: none !important;
+            height: 46px !important;
+            min-height: 46px !important;
+            line-height: 46px !important;
+            padding: 0 !important;
           }}
           .st-key-cover .st-key-homebar [data-testid="stTextInput"] input::placeholder {{
-            color: rgba(255,255,255,0.9) !important;
+            color: rgba(255,255,255,0.48) !important;
+            -webkit-text-fill-color: rgba(255,255,255,0.48) !important;
+            font-weight: 450 !important;
             opacity: 1 !important;
           }}
           .st-key-cover .st-key-homebar [data-baseweb="input"],
@@ -2726,13 +4007,40 @@ def _layout_for(photo_url: str) -> None:
             box-shadow: none !important;
             min-height: 48px !important;
           }}
+          .st-key-cover .st-key-homebar [data-testid="stFormSubmitButton"] {{
+            display: flex !important;
+            justify-content: center !important;
+            align-items: center !important;
+            width: 46px !important;
+            height: 46px !important;
+            margin: 0 !important;
+          }}
           .st-key-cover .st-key-homebar [data-testid="stFormSubmitButton"] button {{
-            background: #F5C400 !important;
+            width: 46px !important;
+            height: 46px !important;
+            min-width: 46px !important;
+            min-height: 46px !important;
+            margin: 0 !important;
+            background: transparent !important;
             border: none !important;
-            box-shadow: 0 6px 18px rgba(0,0,0,0.25) !important;
+            box-shadow: none !important;
+          }}
+          .st-key-cover .st-key-homebar [data-testid="stFormSubmitButton"] button:hover {{
+            background: transparent !important;
           }}
           .st-key-cover .st-key-homebar [data-testid="stFormSubmitButton"] button::after {{
-            border-color: #3F3A34 !important;
+            width: 9px;
+            height: 9px;
+            border-right: 1.5px solid rgba(255,255,255,0.88) !important;
+            border-top: 1.5px solid rgba(255,255,255,0.88) !important;
+            left: 50% !important;
+            top: 50% !important;
+            margin: 0 !important;
+            transform: translate(-58%, -42%) rotate(45deg) !important;
+          }}
+          .st-key-cover .st-key-homebar [data-testid="stFormSubmitButton"] button:hover::after {{
+            border-right-color: #fff !important;
+            border-top-color: #fff !important;
           }}
           .st-key-sheet {{
             position: fixed;
@@ -2741,35 +4049,34 @@ def _layout_for(photo_url: str) -> None:
             min-height: 100dvh;
             margin: 0;
             padding: 0;
-            background: #F4F6F8;
+            background: #F4F3EF;
             overflow-x: hidden;
             overflow-y: auto;
             overscroll-behavior-y: contain;
             scrollbar-width: thin;
             scrollbar-color: #C9CED6 transparent;
           }}
-          .st-key-sheet::before {{
-            content: "";
-            position: fixed;
-            inset: 0 auto 0 0;
-            width: 30%;
-            background:
-              linear-gradient(180deg, rgba(8,12,16,0.22), rgba(8,12,16,0.82)),
-              url("{safe_photo}") center / cover no-repeat;
-          }}
+          /* Pay desk is the only sheet after cover — never flash the old chat rail. */
+          .st-key-sheet::before {{ display: none !important; }}
+          .st-key-sheet .gx-journey-rail {{ display: none !important; }}
           .st-key-sheet .st-key-thread {{
             position: relative;
-            width: 70%;
+            width: 100%;
             max-width: none;
             height: auto;
             min-height: 100dvh;
-            margin: 0 0 0 30%;
-            padding: 2rem clamp(2rem, 5vw, 5.5rem) 2.5rem;
+            margin: 0;
+            padding: 1.4rem 2.2rem 3rem;
             overflow: visible;
             color: #302C27;
-            background:
-              radial-gradient(circle at 92% 2%, rgba(245,196,0,0.13), transparent 28%),
-              #F4F6F8;
+            background: #F4F3EF;
+          }}
+          .st-key-sheet:has(.gx-pay-answer) .st-key-thread {{
+            background: #F7F6F3;
+          }}
+          .st-key-cover:has(+ .st-key-sheet),
+          body:has(.st-key-sheet) .st-key-cover {{
+            display: none !important;
           }}
           .gx-journey-rail {{
             position: fixed;
@@ -2798,6 +4105,28 @@ def _layout_for(photo_url: str) -> None:
             color: rgba(255,255,255,0.82);
             font-size: 0.85rem;
             line-height: 1.5;
+          }}
+          .st-key-new_chat [data-testid="stBaseButton-secondary"],
+          .st-key-new_chat button {{
+            background: #F3F1EC !important;
+            color: #1C1C1C !important;
+            border: 1px solid #E4E2DC !important;
+            border-radius: 999px !important;
+            box-shadow: none !important;
+            font-weight: 650 !important;
+            font-size: 0.92rem !important;
+            min-height: 2.35rem !important;
+            padding: 0.35rem 1.05rem !important;
+            gap: 0.4rem !important;
+          }}
+          .st-key-new_chat button:hover {{
+            background: #ECEAE4 !important;
+            border-color: #D9D6CF !important;
+            color: #1C1C1C !important;
+          }}
+          .st-key-new_chat button svg {{
+            width: 1.05rem !important;
+            height: 1.05rem !important;
           }}
           .gx-live-chip {{
             display: inline-flex;
@@ -2830,16 +4159,10 @@ def _layout_for(photo_url: str) -> None:
             z-index: 8;
           }}
           @media (max-width: 720px) {{
-            .st-key-sheet {{ padding-top: 210px; }}
-            .st-key-sheet::before {{ width: 100%; height: 210px; bottom: auto; }}
             .st-key-sheet .st-key-thread {{
-              width: 100%; min-height: calc(100dvh - 210px); margin: 0;
+              width: 100%; min-height: 100dvh; margin: 0;
               padding: 1.2rem 1.15rem 2rem;
             }}
-            .gx-journey-rail {{
-              position: absolute; top: 88px; bottom: auto; left: 1.4rem; width: 70%;
-            }}
-            .gx-journey-rail .n {{ font-size: 2rem; }}
           }}
           .gx-verdict {{
             font-size: clamp(1.35rem, 2.6vw, 1.8rem);
@@ -3122,6 +4445,130 @@ def _layout_for(photo_url: str) -> None:
             padding: 0.9rem 1rem 0.8rem;
             background: linear-gradient(180deg, #FFFFFF 0%, #FAFBFC 100%);
           }}
+          .gx-wallet {{ margin: 0.2rem 0 0.15rem; }}
+          .gx-xfer {{
+            margin: 0.15rem 0 0.55rem 0.2rem;
+            font-size: 0.9rem; font-weight: 650; color: #1F8A4C;
+          }}
+          .gx-receipt {{ margin-top: 0.7rem; }}
+          .gx-receipt-h {{
+            font-size: 0.84rem; font-weight: 650; color: #20262D;
+            margin: 0.45rem 0 0.1rem;
+          }}
+          .gx-receipt-row {{
+            display: grid; grid-template-columns: 1fr auto; column-gap: 0.7rem; row-gap: 0.08rem;
+            padding: 0.45rem 0; border-top: 1px dashed #F3D2B0; align-items: baseline;
+          }}
+          .gx-receipt-row:first-of-type {{ border-top: 0; }}
+          .gx-receipt-name {{ font-size: 0.8rem; font-weight: 650; color: #20262D; }}
+          .gx-receipt-amt {{ font-size: 0.78rem; font-weight: 650; text-align: right; white-space: nowrap; color: #20262D; }}
+          .gx-receipt-amt.save {{ color: #2E8B57; }}
+          .gx-receipt-row.pay .gx-receipt-name,
+          .gx-receipt-row.pay .gx-receipt-amt {{ font-size: 0.92rem; font-weight: 700; }}
+          .gx-receipt-meta {{ grid-column: 1 / -1; font-size: 0.74rem; color: #8A929B; }}
+          .st-key-planbar {{ margin: 0.2rem 0 0.85rem; }}
+          .st-key-planbar [data-testid="stHorizontalBlock"],
+          .st-key-heldcard [data-testid="stHorizontalBlock"],
+          .st-key-sheet [class*="st-key-farerow"] [data-testid="stHorizontalBlock"],
+          .st-key-sheet [class*="st-key-couponrow"] [data-testid="stHorizontalBlock"] {{
+            flex-wrap: nowrap !important;
+            align-items: center !important;
+          }}
+          .st-key-planbar [data-testid="stHorizontalBlock"] {{
+            background: #fff;
+            border: 1px solid #E4E8ED;
+            border-radius: 16px;
+            padding: 0.7rem 0.9rem 0.75rem;
+            align-items: flex-end !important;
+            gap: 0.7rem;
+          }}
+          .st-key-planbar [data-testid="stColumn"],
+          .st-key-heldcard [data-testid="stColumn"],
+          .st-key-sheet [class*="st-key-farerow"] [data-testid="stColumn"],
+          .st-key-sheet [class*="st-key-couponrow"] [data-testid="stColumn"] {{
+            min-width: 0 !important;
+          }}
+          .gx-steps {{
+            display: flex; gap: 1.15rem; align-items: center;
+            margin: 0.15rem 0 1.15rem;
+          }}
+          .gx-steps span {{
+            display: inline-flex; align-items: center; gap: 0.4rem;
+            font-size: 0.84rem; font-weight: 650; color: #98A2B3;
+          }}
+          .gx-steps span.on, .gx-steps span.done {{ color: #20262D; }}
+          .gx-steps i {{
+            width: 8px; height: 8px; border-radius: 99px; background: #D0D5DD;
+          }}
+          .gx-steps span.on i, .gx-steps span.done i {{ background: #12B76A; }}
+          .gx-stage {{
+            margin: 0 0 0.3rem; font-size: 2rem; line-height: 1.1;
+            letter-spacing: -0.03em; font-weight: 750; color: #20262D;
+          }}
+          .gx-stage-sub {{ margin: 0 0 1rem; color: #667085; font-size: 1rem; font-weight: 500; }}
+          .gx-plan-route {{ font-size: 1.05rem; font-weight: 750; color: #20262D; letter-spacing: -0.02em; }}
+          .gx-plan-meta {{ font-size: 0.75rem; color: #8A929B; font-weight: 600; margin-top: 0.15rem; }}
+          .gx-plan-k {{
+            margin: 0.15rem 0 0.4rem;
+            font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em;
+            text-transform: uppercase; color: #8A929B;
+          }}
+          .st-key-planbar [data-testid="stWidgetLabel"],
+          .st-key-planbar [data-testid="stWidgetLabel"] p {{
+            display: block !important;
+            height: auto !important;
+            margin: 0 0 0.15rem !important;
+            color: #8A929B !important;
+            font-size: 0.68rem !important;
+            font-weight: 700 !important;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+          }}
+          .st-key-cardpick .stButton > button {{
+            justify-content: flex-start;
+            text-align: left;
+            border-radius: 12px !important;
+            background: #fff !important;
+            border: 1px solid #E4E8ED !important;
+            min-height: 52px;
+            font-weight: 650 !important;
+            color: #20262D !important;
+          }}
+          .st-key-cardpick .stButton > button:hover {{
+            border-color: #F5C400 !important;
+            background: #FFFCF3 !important;
+          }}
+          .st-key-heldcard {{
+            background: #fff;
+            border: 1px solid #E4E8ED;
+            border-radius: 16px;
+            padding: 0.65rem 0.85rem;
+            margin-bottom: 0.45rem;
+          }}
+          .gx-swatch {{ width: 36px; height: 28px; border-radius: 6px; }}
+          .gx-held-name {{ font-size: 0.95rem; font-weight: 750; color: #20262D; }}
+          .gx-held-bank {{ font-size: 0.75rem; color: #8A929B; font-weight: 600; }}
+          .st-key-heldcard [data-testid="stWidgetLabel"],
+          .st-key-heldcard [data-testid="stWidgetLabel"] p {{
+            display: block !important;
+            height: auto !important;
+            margin: 0 0 0.1rem !important;
+            color: #8A929B !important;
+            font-size: 0.68rem !important;
+            font-weight: 700 !important;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+          }}
+          .st-key-heldcard [data-testid="stNumberInput"] button {{ display: none !important; }}
+          .st-key-heldcard [data-testid="stNumberInput"] [data-baseweb="input"] {{
+            border: none !important;
+            background: #F4F6F8 !important;
+            border-radius: 10px !important;
+          }}
+          .st-key-heldcard [data-testid="stNumberInput"] input {{
+            font-weight: 700 !important;
+            font-size: 1rem !important;
+          }}
           .gx-offers {{
             margin-top: 0.6rem; padding: 0.85rem 1.05rem 0.7rem;
             border: 1px solid #F3D2B0; border-radius: 14px; background: #FFFCF8;
@@ -3139,12 +4586,19 @@ def _layout_for(photo_url: str) -> None:
           .gx-offer-amt {{ font-size: 0.78rem; font-weight: 650; color: #2E8B57; text-align: right; white-space: nowrap; }}
           .gx-offer-text {{ grid-column: 1 / -1; font-size: 0.82rem; color: #20262D; }}
           .gx-offer-meta {{ grid-column: 1 / -1; font-size: 0.74rem; color: #8A929B; }}
+          .gx-offer-scroll {{
+            max-height: 14.5rem; overflow-y: auto; overscroll-behavior: contain;
+            padding-right: 0.35rem; margin: 0.1rem 0 0.2rem; scrollbar-gutter: stable;
+          }}
+          .gx-offer-scroll::-webkit-scrollbar {{ width: 6px; }}
+          .gx-offer-scroll::-webkit-scrollbar-thumb {{ background: #C9C4BA; border-radius: 999px; }}
+          .gx-offer-scroll::-webkit-scrollbar-track {{ background: transparent; }}
           .gx-ref {{ color: #C56A2D !important; font-weight: 650; text-decoration: none !important; }}
           .gx-ref:hover {{ text-decoration: underline !important; text-underline-offset: 2px; }}
           .gx-sort-label {{ font-size: 0.72rem; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; color: #8A929B; }}
           .gx-offer-note {{ margin-top: 0.4rem; font-size: 0.72rem; color: #8A929B; }}
           .gx-cards {{
-            margin-top: 0.15rem; padding: 0.35rem 0.35rem 0.15rem;
+            margin-top: 0.15rem; padding: 0.55rem 0.75rem 0.45rem;
             border: 0; background: transparent;
           }}
           .gx-cards-h {{ color: #8A929B; }}
@@ -3261,13 +4715,15 @@ def _layout_for(photo_url: str) -> None:
           }}
           div[role="dialog"] .gx-offers,
           div[role="dialog"] .gx-cards,
-          div[role="dialog"] .gx-picks {{
-            padding-left: 0.15rem;
-            padding-right: 0.35rem;
+          div[role="dialog"] .gx-picks,
+          div[role="dialog"] .gx-receipt {{
+            padding-left: 0.75rem;
+            padding-right: 0.75rem;
           }}
           div[role="dialog"] [data-testid="stExpander"] details {{
             border-color: #E6EAEE !important;
             background: #FFFFFF;
+            padding: 0.25rem 0.55rem 0.5rem;
           }}
           div[role="dialog"] [data-testid="stExpander"] summary {{
             font-size: 0.86rem !important;
@@ -3416,90 +4872,91 @@ def _first_ask() -> str:
     return ""
 
 
+def _load_staging(text: str) -> None:
+    """Open the pay desk with sample fares. Does not call a model or a search."""
+    slots = staging_slots(text)
+    depart = _parse_plan_date(slots.get("departure_date")) or date.today()
+    st.session_state.slots = slots
+    st.session_state.last_search_results = staging_flights(slots)
+    st.session_state.last_search_params = slots
+    st.session_state.chat_history = [{"role": "user", "content": text}]
+    st.session_state.pending_turn = None
+    st.session_state.job = None
+    st.session_state.plan_depart = depart
+    st.session_state.plan_return = depart
+    st.session_state.plan_round = False
+    st.session_state.plan_cabin = "Economy"
+    st.session_state.plan_note = ""
+    st.session_state.selected_flight = None
+    st.session_state.fares_shown = FARE_PAGE
+    st.session_state.pay_shown = False
+    st.session_state.stopped_note = False
+    st.session_state.live_fares = False
+    st.session_state.desk_held = True
+
+
 def _begin_from_cover(text: str) -> None:
     text = (text or "").strip()
     if not text:
         return
-    name = (st.session_state.user_name or "").strip()
     query = text
-    if not name:
-        # Name capture is its own small moment on the cover. It is never parsed
-        # as a trip, so the next field can be unambiguously about travel.
-        st.session_state.user_name = text[:40].strip()
-        st.session_state.cover_note = ""
-        st.rerun()
-        return
-    else:
-        st.session_state.cover_note = ""
-        # "Aditi · Hanoi in November" from a signed-in user updates the name too.
-        maybe_name, maybe_trip = _split_name_and_trip(text)
-        if maybe_name and maybe_trip and "·" in text:
-            st.session_state.user_name = maybe_name
-            query = maybe_trip
+    st.session_state.cover_note = ""
+    maybe_name, maybe_trip = _split_name_and_trip(text)
+    if maybe_name and maybe_trip and "·" in text:
+        st.session_state.user_name = maybe_name
+        query = maybe_trip
     if not query:
         st.rerun()
         return
-    # This form is above the workspace in the same run, so execution can
-    # continue directly into the sheet without paying for a second rerun.
-    _queue_turn(query, rerun=False)
+    _load_staging(query)
+    if not st.session_state.get("staging"):
+        _start_job(query)
 
 
 def _arm_cover_departure(name: str, photo_url: str) -> None:
-    """Paint the workspace immediately while Streamlit completes its rerun."""
+    """Paint the pay desk while Streamlit finishes the rerun. No chat shell."""
     import streamlit.components.v1 as components
 
-    name_js = json.dumps(name).replace("<", "\\u003c")
-    greeting_js = json.dumps(_greeting())
-    photo_js = json.dumps(photo_url).replace("<", "\\u003c")
     with st.container(key="depart"):
         components.html(
-            f"""
+            """
             <script>
             const doc = window.parent.document;
             const form = doc.querySelector('.st-key-homebar form');
-            if (form && !form.dataset.gxLeave) {{
+            if (form && !form.dataset.gxLeave) {
               form.dataset.gxLeave = '1';
-              form.addEventListener('submit', () => {{
+              form.addEventListener('submit', () => {
                 const query = form.querySelector('input')?.value?.trim();
                 if (!query || doc.getElementById('gx-transition-shell')) return;
-                if (!doc.getElementById('gx-transition-style')) {{
+                if (!doc.getElementById('gx-transition-style')) {
                   const style = doc.createElement('style');
                   style.id = 'gx-transition-style';
                   style.textContent = `
-                    #gx-transition-shell{{position:fixed;inset:0;z-index:1000;display:grid;
-                      grid-template-columns:30% 70%;background:#f4f6f8;
-                      animation:gxTsIn .55s cubic-bezier(.16,1,.3,1) both;font-family:Manrope,Arial,sans-serif}}
-                    @keyframes gxTsIn{{from{{transform:translateY(100%)}}to{{transform:none}}}}
-                    #gx-transition-shell .rail{{position:relative;background-size:cover;background-position:center;overflow:hidden}}
-                    #gx-transition-shell .rail:after{{content:"";position:absolute;inset:0;background:linear-gradient(180deg,rgba(8,12,16,.2),rgba(8,12,16,.82))}}
-                    #gx-transition-shell .railcopy{{position:absolute;z-index:1;left:10%;right:10%;bottom:9%;color:white}}
-                    #gx-transition-shell .eyebrow{{font-size:11px;font-weight:700;letter-spacing:.16em;text-transform:uppercase}}
-                    #gx-transition-shell .name{{font-size:clamp(24px,3vw,42px);font-weight:700;line-height:1.05;letter-spacing:-.045em;margin-top:12px}}
-                    #gx-transition-shell .desk{{padding:34px clamp(32px,5vw,88px);background:radial-gradient(circle at 92% 2%,rgba(245,196,0,.14),transparent 28%),#f4f6f8}}
-                    #gx-transition-shell .brand{{font-size:14px;font-weight:700;color:#111827}}
-                    #gx-transition-shell .load{{height:75%;display:flex;flex-direction:column;justify-content:center;max-width:520px}}
-                    #gx-transition-shell .query{{width:max-content;max-width:100%;padding:8px 12px;border-radius:12px;background:#f5c400;color:#302c27;font-size:14px}}
-                    #gx-transition-shell h2{{font-size:clamp(28px,4vw,48px);line-height:1.05;letter-spacing:-.045em;color:#111827;margin:24px 0 10px}}
-                    #gx-transition-shell p{{color:#667085;margin:0}}
-                    #gx-transition-shell .pulse{{width:44px;height:4px;border-radius:9px;background:#dfe3e8;margin-top:28px;overflow:hidden}}
-                    #gx-transition-shell .pulse:after{{content:"";display:block;width:55%;height:100%;background:#f5c400;animation:gxTsPulse 1s ease-in-out infinite alternate}}
-                    @keyframes gxTsPulse{{to{{transform:translateX(82%)}}}}
-                    @media(max-width:720px){{#gx-transition-shell{{grid-template-columns:1fr;grid-template-rows:210px 1fr}}#gx-transition-shell .desk{{padding:24px}}}}
+                    #gx-transition-shell{position:fixed;inset:0;z-index:1100;background:#F4F3EF;
+                      animation:gxTsIn .25s cubic-bezier(.16,1,.3,1) both;font-family:Manrope,Arial,sans-serif;
+                      padding:1.4rem 2.2rem 3rem}
+                    @keyframes gxTsIn{from{opacity:.4;transform:translateY(12px)}to{opacity:1;transform:none}}
+                    #gx-transition-shell .bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:1.6rem}
+                    #gx-transition-shell .brand{font-size:14px;font-weight:700;color:#111827}
+                    #gx-transition-shell .grid{display:grid;grid-template-columns:1.05fr .95fr;gap:2rem;align-items:start}
+                    #gx-transition-shell .step{font-size:0.72rem;letter-spacing:0.14em;font-weight:700;color:#8C8A84}
+                    #gx-transition-shell h2{font-size:clamp(2.2rem,4vw,3.2rem);line-height:0.98;letter-spacing:-.045em;font-weight:750;color:#161616;margin:.5rem 0 0}
+                    #gx-transition-shell h2 em{display:block;font-style:normal;color:#F5C400}
+                    #gx-transition-shell .card{background:#fff;border:1px solid #ECEAE4;border-radius:28px;min-height:18rem;
+                      box-shadow:0 10px 30px rgba(20,20,20,0.04)}
+                    @media(max-width:720px){#gx-transition-shell .grid{grid-template-columns:1fr}}
                   `;
                   doc.head.appendChild(style);
-                }}
+                }
                 const shell = doc.createElement('div');
                 shell.id = 'gx-transition-shell';
-                shell.innerHTML = '<aside class="rail"><div class="railcopy"><div class="eyebrow">Your journey</div><div class="name"></div></div></aside>'
-                  + '<main class="desk"><div class="brand">GarudaX <small> BETA</small></div><div class="load"><div class="query"></div>'
-                  + '<h2>Opening your flight desk…</h2><p>Getting the route ready while the live search starts.</p><div class="pulse"></div></div></main>';
-                shell.querySelector('.rail').style.backgroundImage = `url("${{{photo_js}}}")`;
-                shell.querySelector('.name').textContent = {greeting_js} + ', ' + {name_js} + '.';
-                shell.querySelector('.query').textContent = query;
+                shell.innerHTML = '<div class="bar"><div class="brand">GarudaX <span style="background:#f5c400;border-radius:999px;padding:2px 8px;font-size:10px">BETA</span></div></div>'
+                  + '<div class="grid"><div><div class="step">STEP 2 OF 2</div>'
+                  + '<h2>Tell me how<br><em>you want to pay.</em></h2></div><div class="card"></div></div>';
                 doc.body.appendChild(shell);
-                window.setTimeout(() => shell.remove(), 12000);
-              }});
-            }}
+                window.setTimeout(() => shell.remove(), 8000);
+              });
+            }
             </script>
             """,
             height=0,
@@ -3605,7 +5062,7 @@ def _render_turn_steps(msg: dict, idx: int, show_raw: bool) -> None:
                     st.json(msg["trace"])
 
 
-def main() -> None:
+def main(staging: bool = False) -> None:
     st.set_page_config(
         page_title="GarudaX · Beta",
         page_icon="✦",
@@ -3613,6 +5070,7 @@ def main() -> None:
         initial_sidebar_state="collapsed",
     )
     _inject_styles()
+    st.session_state.staging = bool(staging)
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
@@ -3654,11 +5112,15 @@ def main() -> None:
         st.session_state.booking_ready_url = None
     if "confirmed_travellers" not in st.session_state:
         st.session_state.confirmed_travellers = []
+    if "wallet_card_id" not in st.session_state:
+        st.session_state.wallet_card_id = None
+    if "wallet_points" not in st.session_state:
+        st.session_state.wallet_points = 0
     if st.session_state.get("bg_url") not in BACKGROUNDS:
         st.session_state.bg_url = random.choice(BACKGROUNDS)
     if "cover_note" not in st.session_state:
         st.session_state.cover_note = ""
-    if LANGGRAPH_AVAILABLE and "flight_graph" not in st.session_state:
+    if LANGGRAPH_AVAILABLE and not staging and "flight_graph" not in st.session_state:
         try:
             st.session_state.flight_graph = create_flight_finder_graph()
         except Exception as e:
@@ -3670,58 +5132,57 @@ def main() -> None:
     _layout_for(photo_url)
     debug_ok = _debug_allowed(name)
     brand = '<span class="gx-mark">GarudaX</span><span class="gx-beta">Beta</span>'
-    asked = _first_ask()
-    asked_html = f'<p class="gx-asked">{html.escape(asked)}</p>' if asked else ""
-    sub = (
-        "Start with the trip in your own words. We’ll shape the rest together."
-        if name
-        else "What should we call you?"
+    desk_ready = bool(
+        st.session_state.get("last_search_results")
+        or st.session_state.get("desk_held")
+        or st.session_state.pending_turn
+        or st.session_state.get("job")
     )
-    with st.container(key="cover"):
-        st.markdown(
-            f'<div class="gx-cover-copy"><p class="gx-kicker">GarudaX</p>{_split_heading(name)}'
-            f'<p class="gx-sub">{sub}</p>'
-            f"{asked_html}</div>",
-            unsafe_allow_html=True,
-        )
-        if not name:
-            with st.container(key="homebar"):
-                with st.form("home_name", clear_on_submit=True, border=False):
-                    field, go_col = st.columns([12, 1], vertical_alignment="center")
-                    with field:
-                        name_input = st.text_input(
-                            "Your name",
-                            placeholder="Your first name",
-                            label_visibility="collapsed",
-                        )
-                    with go_col:
-                        go = st.form_submit_button("Continue")
-            if go:
-                _begin_from_cover(name_input or "")
-        else:
+    # Cover only before a trip starts — never under the pay desk.
+    if not desk_ready:
+        with st.container(key="cover"):
+            st.markdown(
+                '<div class="gx-cover-copy"><p class="gx-kicker">GarudaX</p>'
+                "<h1>Tell us where you're going.</h1>"
+                "<p class=\"gx-promise\">We'll find what you actually pay.</p>"
+                "<p class=\"gx-sub\">The cash fare<i>·</i>Your card offer<i>·</i>Your points</p></div>",
+                unsafe_allow_html=True,
+            )
             with st.container(key="homebar"):
                 with st.form("trip_query", clear_on_submit=True, border=False):
                     field, go_col = st.columns([12, 1], vertical_alignment="center")
                     with field:
                         trip_input = st.text_input(
                             "Your trip",
-                            placeholder="Try: Vietnam next month from Delhi",
+                            placeholder="Delhi to Singapore on 20 November",
                             label_visibility="collapsed",
                         )
                     with go_col:
                         trip_go = st.form_submit_button("Continue")
             if trip_go:
                 _begin_from_cover(trip_input or "")
-        if st.session_state.get("cover_note"):
-            st.markdown(
-                f'<p class="gx-cover-note">{html.escape(st.session_state.cover_note)}</p>',
-                unsafe_allow_html=True,
-            )
-        if name:
-            _arm_cover_departure(name, photo_url)
+                # Next paint is pay desk only — avoid cover + old sheet in one frame.
+                st.rerun()
+            if st.session_state.get("cover_note"):
+                st.markdown(
+                    f'<p class="gx-cover-note">{html.escape(st.session_state.cover_note)}</p>',
+                    unsafe_allow_html=True,
+                )
+            _arm_cover_departure(name or "there", photo_url)
+
+    if not st.session_state.get("last_search_results") and not st.session_state.get("desk_held"):
+        asked = _first_ask()
+        running = st.session_state.get("job") or {}
+        busy = bool(running) and not running.get("done") and not running.get("stopped")
+        if asked and not busy:
+            st.session_state.desk_held = True
+            _load_staging(asked)
+            if not staging:
+                _start_job(asked)
 
     sheet_empty = not (
-        st.session_state.chat_history
+        st.session_state.get("last_search_results")
+        or st.session_state.get("desk_held")
         or st.session_state.pending_turn
         or st.session_state.get("job")
     )
@@ -3731,55 +5192,70 @@ def main() -> None:
         return
 
     with st.container(key="sheet"):
-        _clear_transition_shell()
-        st.markdown(
-            f'<aside class="gx-journey-rail"><div class="k">Your journey</div>'
-            f'<div class="n">{html.escape(_greeting())},<br>{html.escape(name)}.</div>'
-            '<div class="s">Ask, compare and refine without leaving the trip.</div>'
-            '<div class="gx-live-chip">Live workspace</div></aside>',
-            unsafe_allow_html=True,
-        )
+        has_fares = bool(st.session_state.get("last_search_results"))
+        pay_mode = "gx-pay-answer" if st.session_state.get("pay_shown") else "gx-pay-ask"
+        # Marker first so CSS never paints the old chat rail/yellow thread.
+        st.markdown(f'<div class="gx-pay {pay_mode}"></div>', unsafe_allow_html=True)
         with st.container(key="thread"):
-            bar_l, bar_r = st.columns([3, 2], vertical_alignment="center")
-            with bar_l:
-                st.markdown(f'<div>{brand}</div>', unsafe_allow_html=True)
-            with bar_r:
-                dev_col, chat_col = st.columns([1.15, 1], vertical_alignment="center")
-                with dev_col:
-                    if debug_ok:
-                        st.toggle("DEV MODE", key="debug_on")
-                    else:
-                        st.toggle("DEV MODE", value=False, disabled=True, key="dev_mode_locked")
-                with chat_col:
-                    new_chat = st.button("New chat", key="new_chat", type="primary")
-                if new_chat:
-                    request_stop()
-                    running = st.session_state.get("job")
-                    if running is not None:
-                        running["stopped"] = True
-                    st.session_state.job = None
-                    st.session_state.is_calling_model = False
-                    st.session_state.chat_history = []
-                    st.session_state.user_name = ""
-                    st.session_state.slots = {**DEFAULT_SLOTS}
-                    st.session_state.conversation_id = str(uuid.uuid4())
-                    st.session_state.turn_index = 1
-                    st.session_state.last_search_results = None
-                    st.session_state.last_search_params = None
-                    st.session_state.search_history = []
-                    st.session_state.error_context = None
-                    st.session_state.price_stats = None
-                    st.session_state.window_scan = None
-                    st.session_state.suggested_alternatives = None
-                    st.session_state.pending_turn = None
-                    st.session_state.pending_shown = False
-                    st.session_state.stopped_note = False
-                    st.session_state.agent_trace = None
-                    st.session_state.card_picks = None
-                    st.session_state.selected_flight = None
-                    st.session_state.booking_ready_url = None
-                    st.session_state.confirmed_travellers = []
-                    st.rerun()
+            go_back = False
+            if has_fares and st.session_state.get("pay_shown"):
+                back_col, bar_l, bar_r = st.columns([1, 4, 1.35], vertical_alignment="center")
+                with back_col:
+                    go_back = st.button("Back", key="pay_back")
+                with bar_l:
+                    st.markdown(f'<div>{brand}</div>', unsafe_allow_html=True)
+                with bar_r:
+                    new_chat = st.button(
+                        "New trip",
+                        key="new_chat",
+                        icon=":material/refresh:",
+                    )
+            else:
+                bar_l, bar_r = st.columns([5, 1.35], vertical_alignment="center")
+                with bar_l:
+                    st.markdown(f'<div>{brand}</div>', unsafe_allow_html=True)
+                with bar_r:
+                    new_chat = st.button(
+                        "New trip",
+                        key="new_chat",
+                        icon=":material/refresh:",
+                    )
+            if go_back:
+                st.session_state.pay_shown = False
+                st.rerun()
+            if new_chat:
+                request_stop()
+                running = st.session_state.get("job")
+                if running is not None:
+                    running["stopped"] = True
+                st.session_state.job = None
+                st.session_state.is_calling_model = False
+                st.session_state.chat_history = []
+                st.session_state.user_name = ""
+                st.session_state.slots = {**DEFAULT_SLOTS}
+                st.session_state.conversation_id = str(uuid.uuid4())
+                st.session_state.turn_index = 1
+                st.session_state.last_search_results = None
+                st.session_state.last_search_params = None
+                st.session_state.search_history = []
+                st.session_state.error_context = None
+                st.session_state.price_stats = None
+                st.session_state.window_scan = None
+                st.session_state.suggested_alternatives = None
+                st.session_state.pending_turn = None
+                st.session_state.pending_shown = False
+                st.session_state.stopped_note = False
+                st.session_state.agent_trace = None
+                st.session_state.card_picks = None
+                st.session_state.selected_flight = None
+                st.session_state.booking_ready_url = None
+                st.session_state.confirmed_travellers = []
+                st.session_state.desk_step = "trip"
+                st.session_state.wallet_card_id = None
+                st.session_state.pay_shown = False
+                st.session_state.live_fares = False
+                st.session_state.desk_held = False
+                st.rerun()
 
             pending = st.session_state.pending_turn
             already = st.session_state.get("job")
@@ -3795,57 +5271,26 @@ def main() -> None:
                 cooldown_until = float(st.session_state.get("rate_limit_until") or 0)
                 st.session_state.pending_turn = None
                 st.session_state.pending_shown = False
-                if now < cooldown_until:
-                    remaining = int(cooldown_until - now) + 1
-                    st.warning(f"Give it about {remaining}s, then try once more.")
-                else:
-                    logger.info("Processing user message (len=%d) on a background turn", len(pending))
-                    _start_job(pending)
+                _load_staging(pending)
+                if not st.session_state.get("staging"):
+                    if now < cooldown_until:
+                        remaining = int(cooldown_until - now) + 1
+                        st.session_state.plan_note = f"Give it about {remaining}s, then try once more."
+                    else:
+                        logger.info("Processing user message (len=%d) on a background turn", len(pending))
+                        _start_job(pending)
 
             job = st.session_state.get("job")
             job_running = bool(job) and not job.get("done") and not job.get("stopped")
-            show_raw = bool(debug_ok and st.session_state.get("debug_on"))
-            history = st.session_state.chat_history
-            live_idx = None
-            if job_running:
-                for i in range(len(history) - 1, -1, -1):
-                    if history[i]["role"] == "user":
-                        live_idx = i
-                        break
-            for idx, msg in enumerate(history):
-                if msg["role"] == "user":
-                    _user_line(msg, with_stop=idx == live_idx)
-                else:
-                    with st.container(key=f"reply{idx}"):
-                        _render_turn_steps(msg, idx, show_raw)
-                        st.markdown(msg["content"])
-
-            if not job_running:
-                _render_paths()
-            _render_trip_board()
             _results = st.session_state.get("last_search_results") or []
-            if _results:
-                st.download_button(
-                    label="Download these flights",
-                    data=flights_to_csv(_results),
-                    mime="text/csv",
-                    file_name="garudax_flights.csv",
-                    key="download_flights_csv",
-                )
+            desk_on = bool(_results) or bool(st.session_state.get("desk_held"))
+            # Pay desk only after the cover. No chat thread, paths, or ask box.
+            if desk_on:
+                _render_trip_board()
             if job_running:
                 _watch_job()
-                label = (st.session_state.get("job") or {}).get("status_label") or "Looking…"
-                st.markdown(
-                    f'<p class="gx-wait"><span class="gx-pulse"></span>{html.escape(label)}</p>',
-                    unsafe_allow_html=True,
-                )
-            elif st.session_state.get("stopped_note"):
-                st.markdown(
-                    '<p class="gx-wait">Stopped. Change the trip below and search again.</p>',
-                    unsafe_allow_html=True,
-                )
-            if not job_running:
-                _ask_box("reply")
+            # Drop the browser overlay only after the real desk is on screen.
+            _clear_transition_shell()
 
     if st.session_state.get("selected_flight"):
         _passenger_dialog()
@@ -3854,5 +5299,19 @@ def main() -> None:
     st.session_state.pop("snap_up", None)
 
 
+def _page_live() -> None:
+    main(staging=False)
+
+
+def _page_staging() -> None:
+    main(staging=True)
+
+
 if __name__ == "__main__":
-    main()
+    st.navigation(
+        [
+            st.Page(_page_live, title="GarudaX", default=True),
+            st.Page(_page_staging, title="Staging", url_path="staging"),
+        ],
+        position="hidden",
+    ).run()

@@ -16,9 +16,11 @@ import html as html_lib
 import logging
 import re
 from datetime import date, datetime
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import requests
+
+from src.services.scrape_http import ScrapeBlocked, polite_get
 
 logger = logging.getLogger(__name__)
 
@@ -307,10 +309,8 @@ def _bank_from(*texts: str) -> Optional[str]:
 
 
 def _get(url: str, timeout: int = 25) -> str:
-    resp = requests.get(url, headers={"User-Agent": UA, "Accept-Language": "en-IN,en;q=0.9"}, timeout=timeout)
-    if resp.status_code != 200 or not resp.text:
-        raise RuntimeError(f"HTTP {resp.status_code} for {url}")
-    return resp.text
+    """Public page GET with host pacing; raises ScrapeBlocked on 403/429."""
+    return polite_get(url, timeout=timeout)
 
 
 def _goibibo_listing(raw_html: str) -> List[Dict]:
@@ -518,18 +518,102 @@ def parse_cleartrip_offers(raw_html: str, base_url: str = "https://www.cleartrip
     return rows
 
 
-# name -> callable(known_cards) -> rows. Only public pages that answer a normal GET.
-# MakeMyTrip's own domain and the airlines sit behind Akamai and tarpit scripts;
-# Goibibo is MakeMyTrip group and publishes the same bank-offer pool openly.
-SCRAPE_SOURCES = {
-    "axis_grab_deals": lambda known: parse_axis_grab_deals(_get("https://www.axisbank.com/grab-deals")),
-    "goibibo": fetch_goibibo,
-    "ixigo": lambda known: parse_ixigo_offers(_get("https://www.ixigo.com/offers")),
-    "cleartrip": lambda known: parse_cleartrip_offers(_get("https://www.cleartrip.com/all-offers/"), known_cards=known),
-}
+def parse_generic_flight_bank_offers(
+    raw_html: str,
+    *,
+    site: str,
+    merchant: str,
+    base_url: str,
+    known_cards: Optional[List[str]] = None,
+) -> List[Dict]:
+    """Best-effort parse for public deal hubs: bank mention + flight + %/₹/code."""
+    text = html_lib.unescape(re.sub(r"(?is)<script[\s\S]*?</script>|<style[\s\S]*?</style>", " ", raw_html or ""))
+    # Split on common card / offer containers and headings.
+    chunks = re.split(
+        r"(?is)(?=<div[^>]*(?:offer|deal|coupon|promo)[^>]*>)|(?=<article\b)|(?=<li\b)|(?=<h[2-4]\b)",
+        text,
+    )
+    if len(chunks) < 3:
+        chunks = re.split(r"(?is)</(?:div|li|article|h[2-4])>", text)
+    rows: List[Dict] = []
+    seen = set()
+    for chunk in chunks:
+        plain = re.sub(r"(?is)<[^>]+>", " ", chunk)
+        plain = re.sub(r"\s+", " ", plain).strip()
+        if len(plain) < 40 or len(plain) > 1200:
+            continue
+        if not _BANK_WORDS.search(plain):
+            continue
+        if not re.search(r"flight|airline|fly|domestic|international|air\b", plain, re.I):
+            continue
+        if re.search(r"\bhotel|\bbus\b|\btrain\b|\bcab\b", plain, re.I) and not re.search(r"flight", plain, re.I):
+            continue
+        href_m = re.search(r'href="(https?://[^"]+|/[^"]+)"', chunk)
+        href = href_m.group(1) if href_m else base_url
+        if href.startswith("/"):
+            from urllib.parse import urljoin
+            href = urljoin(base_url, href)
+        banks = {_bank_from(w) for w in _BANK_WORDS.findall(plain)} - {None}
+        title = plain[:240]
+        key = (site, title[:80], tuple(sorted(banks)))
+        if key in seen:
+            continue
+        seen.add(key)
+        for bank in sorted(banks):
+            eligible, excluded = _cards_mentioned(plain, bank, known_cards)
+            rows.append({
+                "source": "scraped", "site": site, "bank": bank,
+                "card_name": eligible[0] if len(eligible) == 1 else None,
+                "card_kind": _card_kind(plain), "merchant": merchant,
+                "segment": _segment_in(plain), "eligible_cards": eligible, "excluded_cards": excluded,
+                "title": title, "code": _coupon_code(plain),
+                "percent_off": _percent_in(plain), "max_amount": _cap_in(plain),
+                "flat_amount": _money_in(plain) if ("flat" in plain.lower() and not _percent_in(plain)) else None,
+                "min_spend": _min_spend_in(plain), "applies_to": "flights",
+                "terms_url": href, "detail_url": href,
+                "valid_from": None, "valid_until": None,
+            })
+    return rows
+
+
+def _fetch_generic_hub(agg_id: str, known_cards: Optional[List[str]] = None) -> List[Dict]:
+    from src.services.aggregators import BY_ID
+    agg = BY_ID[agg_id]
+    raw = _get(agg.offer_url)
+    return parse_generic_flight_bank_offers(
+        raw, site=agg.id, merchant=agg.name, base_url=agg.offer_url, known_cards=known_cards,
+    )
+
+
+def _build_scrape_sources() -> Dict[str, Callable]:
+    """Dedicated parsers where we have them; generic GET parser for the rest of top-20 hubs."""
+    from src.services.aggregators import scrape_targets
+
+    dedicated: Dict[str, Callable] = {
+        "axis_grab_deals": lambda known: parse_axis_grab_deals(_get("https://www.axisbank.com/grab-deals")),
+        "goibibo": fetch_goibibo,
+        "ixigo": lambda known: parse_ixigo_offers(_get("https://www.ixigo.com/offers")),
+        "cleartrip": lambda known: parse_cleartrip_offers(
+            _get("https://www.cleartrip.com/all-offers/"), known_cards=known,
+        ),
+    }
+    out: Dict[str, Callable] = {}
+    for agg in scrape_targets():
+        if agg.id in dedicated:
+            out[agg.id] = dedicated[agg.id]
+        else:
+            out[agg.id] = (lambda aid: (lambda known: _fetch_generic_hub(aid, known)))(agg.id)
+    return out
+
+
+# Populated from aggregators.scrape_targets() — top-20 OTAs + bank hubs with public GET pages.
+# MakeMyTrip main domain is scrape_hard (use Goibibo); book links still cover MMT.
+SCRAPE_SOURCES = _build_scrape_sources()
 
 
 def fetch_source(name: str, known_cards: Optional[List[str]] = None) -> List[Dict]:
+    if name not in SCRAPE_SOURCES:
+        raise KeyError(f"Unknown scrape source {name!r}")
     rows = SCRAPE_SOURCES[name](known_cards)
     now = datetime.utcnow().isoformat()
     for r in rows:
@@ -750,6 +834,9 @@ def enrich_card_details(cards: List[Dict], max_cards: int = 80, timeout: int = 2
             continue
         try:
             d = parse_paisabazaar_card_detail(_get(url, timeout))
+        except ScrapeBlocked as exc:
+            logger.warning("card detail host blocked (%s); skipping rest of detail pages", exc)
+            break
         except Exception as exc:
             logger.warning("card detail %s failed: %s", c.get("card_name"), exc)
             continue
@@ -769,10 +856,8 @@ def enrich_card_details(cards: List[Dict], max_cards: int = 80, timeout: int = 2
 
 def fetch_catalog_source(name: str, timeout: int = 25) -> List[Dict]:
     url, parser = CARD_CATALOG_SOURCES[name]
-    resp = requests.get(url, headers={"User-Agent": UA, "Accept-Language": "en-IN,en;q=0.9"}, timeout=timeout)
-    if resp.status_code != 200 or not resp.text:
-        raise RuntimeError(f"{name}: HTTP {resp.status_code}")
-    rows = parser(resp.text, resp.url)
+    raw = polite_get(url, timeout=timeout)
+    rows = parser(raw, url)
     now = datetime.utcnow().isoformat()
     for r in rows:
         r["fetched_at"] = now

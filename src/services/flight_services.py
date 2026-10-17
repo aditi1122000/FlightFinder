@@ -451,6 +451,30 @@ def call_mistral_with_backoff(payload: Dict, retries: int = RETRIES, base_delay:
     raise Exception(f"Failed after {retries} retries. Last error: {last_exc}")
 
 
+def _drop_breaks_inside_strings(text: str) -> str:
+    """Models sometimes wrap mid-value ('"2\\n025-12-23"'). Drop those breaks."""
+    out: list[str] = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if escape:
+            out.append(ch)
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            out.append(ch)
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            continue
+        if in_string and ch in "\n\r":
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
 def clean_json_text(text: str) -> str:
     if not isinstance(text, str):
         return text
@@ -460,12 +484,15 @@ def clean_json_text(text: str) -> str:
     last = cleaned.rfind("}")
     if first != -1 and last != -1 and last > first:
         cleaned = cleaned[first : last + 1]
+    cleaned = _drop_breaks_inside_strings(cleaned)
     # Gemini sometimes splits a key across a newline: "\nstatus"
     cleaned = re.sub(
         r'"\s*([A-Za-z_][A-Za-z0-9_]*)\s*"\s*:',
         r'"\1":',
         cleaned,
     )
+    # Year split by a space: "2 025-12-23"
+    cleaned = re.sub(r'"(\d)\s+(\d{3}-\d{2}-\d{2})"', r'"\1\2"', cleaned)
     cleaned = re.sub(r',(\s*[}\]])', r'\1', cleaned)
     return cleaned.strip()
 
@@ -1128,21 +1155,20 @@ def ota_search_url_for_offer(
     flight: Optional[Dict] = None,
 ) -> str:
     """Route search on the site that honours the offer, with coupon when we have one."""
+    from src.services.aggregators import coupon_query, match_aggregator
+
     offer = offer if isinstance(offer, dict) else {}
-    base = ota_search_url(offer.get("merchant") or offer.get("site") or "", origin_code, dest_code, slots)
-    merchant = (offer.get("merchant") or offer.get("site") or "").lower()
+    blob = f"{offer.get('merchant') or ''} {offer.get('site') or ''}"
+    agg = match_aggregator(blob)
+    base = ota_search_url(blob, origin_code, dest_code, slots)
     code = str(offer.get("code") or "").strip()
     extra: Dict[str, str] = {}
-    if code and "cleartrip" in merchant:
+    if code and agg:
+        extra.update(coupon_query(agg.id, code))
+    elif code:
         extra["coupon"] = code
-    elif code and "makemytrip" in merchant:
-        extra["coupon"] = code
-    elif code and "goibibo" in merchant:
-        extra["cpnCode"] = code
-    elif code and "ixigo" in merchant:
-        extra["couponCode"] = code
     carrier = carrier_code_from_flight(flight)
-    if carrier and "cleartrip" in merchant:
+    if carrier and agg and agg.id == "cleartrip":
         extra["airline"] = carrier
     return _append_query(base, extra)
 
@@ -1220,7 +1246,13 @@ def build_ixigo_search_url(origin_code: str, dest_code: str, slots: Dict) -> str
 
 
 def ota_search_url(merchant: str, origin_code: str, dest_code: str, slots: Dict) -> str:
-    """Search URL on the site that actually honours the card offer."""
+    """Search URL on the site that actually honours the card offer (top-20 registry)."""
+    from src.services.aggregators import build_search_url, match_aggregator
+
+    agg = match_aggregator(merchant or "")
+    if agg:
+        return build_search_url(agg.id, origin_code, dest_code, slots)
+    # Legacy fallbacks if the blob did not match the registry.
     name = (merchant or "").lower()
     if "cleartrip" in name:
         return build_cleartrip_search_url(origin_code, dest_code, slots)
@@ -1242,6 +1274,27 @@ _provider_cooldown: Dict[str, float] = {}
 
 class ProviderQuotaExceeded(Exception):
     """The provider refused for quota; skip it until the cooldown ends."""
+
+
+_health_last_at: Dict[str, float] = {}
+
+
+def _log_fare_health(provider: str, status: str, message: str, origin: str, dest: str) -> None:
+    """Throttle health rows so a burst of searches does not flood the table."""
+    key = f"{provider}:{status}"
+    now = time.monotonic()
+    if now - _health_last_at.get(key, 0.0) < 60:
+        return
+    _health_last_at[key] = now
+    try:
+        from src.services.supabase_persistence import record_health_event
+        record_health_event(
+            "fare_api", provider, status,
+            message=message[:500],
+            detail={"origin": origin, "destination": dest},
+        )
+    except Exception:
+        logger.debug("fare health log skipped", exc_info=True)
 
 
 def _fare_cache_key(provider: str, origin_code: str, dest_code: str, slots: Dict) -> tuple:
@@ -1351,8 +1404,10 @@ def _provider_route(
     except ProviderQuotaExceeded:
         _provider_cooldown[provider] = time.monotonic() + PROVIDER_COOLDOWN_S
         logger.warning("%s: quota exhausted, pausing for %ds", provider, PROVIDER_COOLDOWN_S)
+        _log_fare_health(provider, "blocked", "provider_quota", origin_code, dest_code)
         return [], "provider_quota"
-    except PermissionError:
+    except PermissionError as exc:
+        _log_fare_health(provider, "blocked", f"api_error_4xx: {exc}", origin_code, dest_code)
         return [], "api_error_4xx"
     departure_date = _to_str(slots.get("departure_date"))
     cabin = (_to_str(slots.get("cabin_class")) or "economy").lower()

@@ -1,0 +1,16 @@
+---
+description: Senior scraping standard for public bank card pages and rupee-per-point rates. Use when adding a bank, a catalogue, or a points rate.
+globs: src/services/**/*points*.py,src/services/offers.py
+alwaysApply: false
+---
+
+# Scraping agent
+
+Work as the senior scraping engineer (15 years). Store only what the public page states.
+
+- Columns: bank, card, points name, rupees per point. The screen multiplies a balance by that rate.
+- Take the rate from that card's own copy. "1 EDGE Mile is equal to ₹1" is a rate. "1,500 EDGE Miles worth ₹1,500" is a rate when it divides evenly to paise.
+- Leave the rate empty when the page does not state one. Do not invent a number.
+- Do not store a give/get ratio, a partner-mile conversion, or a percent of the fare.
+- Ignore another card's promo, the site header, and SMS or merchant-category tables.
+- Public pages only. Grab Deals is coupons, not rupees per point. Cache the result. On a failed fetch, keep the last good cache and name the pages that failed.
