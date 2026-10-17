@@ -1,15 +1,25 @@
-name: Refresh offers
+name: Refresh all batch scrapers
 
-# Three times a day: 07:00, 15:00, 21:00 IST.
+# Manual / emergency: run every batch task from the prod diagram in one workflow
+# (separate jobs so each shows its own status). Prefer the dedicated workflows
+# for normal schedule (offers / travel cards / point rates / route watch).
 on:
-  schedule:
-    - cron: "30 1,9,15 * * *"
   workflow_dispatch:
+    inputs:
+      skip_routes:
+        description: "Skip fare_discounts + route_watch"
+        type: boolean
+        default: false
+      skip_points:
+        description: "Skip Axis + card_point_rates"
+        type: boolean
+        default: false
 
 jobs:
-  refresh:
+  catalog:
+    name: Travel cards
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,10 +27,65 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Refresh card offers and fare discounts
+      - name: --only catalog
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python scripts/refresh_offers.py --only catalog
+
+  offers:
+    name: Card offers
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: catalog
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: --only offers
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python scripts/refresh_offers.py --only offers
+
+  points:
+    name: Point rates
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: catalog
+    if: ${{ inputs.skip_points != true }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: --only points
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python scripts/refresh_offers.py --only points
+
+  routes:
+    name: Route watch
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ inputs.skip_routes != true }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: --only routes,watch
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
           RAPIDAPI_HOST: ${{ secrets.RAPIDAPI_HOST }}
-        run: python scripts/refresh_offers.py --routes --watch
+        run: python scripts/refresh_offers.py --only routes,watch

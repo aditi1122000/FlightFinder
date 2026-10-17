@@ -1,0 +1,26 @@
+name: Scrape point rates
+
+# Diagram: "Rupees per point — batch scrape"
+# Axis public pages + each credit_cards listing → card_point_rates.
+# Cadence: Mon/Wed/Fri once (IST 08:00), after catalogue usually finishes.
+on:
+  schedule:
+    - cron: "0 3 * * 1,3,5"
+  workflow_dispatch:
+
+jobs:
+  points:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Scrape Axis + catalogue pages → card_point_rates
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python scripts/refresh_offers.py --only points

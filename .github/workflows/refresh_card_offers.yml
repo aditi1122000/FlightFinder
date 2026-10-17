@@ -1,0 +1,26 @@
+name: Scrape card offers
+
+# Diagram: "Card offers — batch scrape"
+# Public deal pages → card_offers + expire stale rows.
+# Cadence: Mon/Wed/Fri once (IST 07:00) — light enough to avoid IP blacklists.
+on:
+  schedule:
+    - cron: "30 1 * * 1,3,5"
+  workflow_dispatch:
+
+jobs:
+  offers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Scrape offer hubs → card_offers
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python scripts/refresh_offers.py --only offers

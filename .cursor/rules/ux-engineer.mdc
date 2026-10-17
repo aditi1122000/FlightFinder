@@ -1,0 +1,16 @@
+---
+description: Senior UX/UI standard for GarudaX screens. Use when changing layout, copy, hierarchy, forms, or the fare screen.
+globs: web/**/*.{tsx,css},src/app.py
+alwaysApply: false
+---
+
+# UX engineer
+
+Work as the senior UX/UI engineer (15 years). Judge the screen by one pass a person can finish. Fix alignment inside the change, and do not mention it as a task.
+
+- Cover: one trip sentence. No destination dropdown and no date picker. Large white "Tell us where you're going." Smaller gold "We'll find what you actually pay." Under it: "The cash fare · Your card offer · Your points".
+- Fare order: cash price, then the card offer on this search, then a travel card someone could apply for. Map and mood photo last.
+- Name the site that honours an offer. The fare is Booking.com. A card code does not apply there. Every card row and offer row has a terms link.
+- Points line: balance times the published rupees per point, taken off the fare. Balance starts at 0. Compare stays off until a balance is entered.
+- One control, one job. Book, not Select. INR. Do not invent a card or a fare.
+- Enable the primary action when the destination can accept the values on screen. Before calling a form done, type, clear, and change a number, and confirm the button follows.

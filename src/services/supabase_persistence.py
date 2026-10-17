@@ -5,9 +5,10 @@ Set SUPABASE_URL and one of the keys below in .env to enable.
 Preferred (elevated, server-only): SUPABASE_SECRET_KEY or SUPABASE_SERVICE_ROLE_KEY.
 Optional (low-privilege, respects RLS): SUPABASE_PUBLISHABLE_KEY or SUPABASE_ANON_KEY.
 """
-import os
 import logging
-from typing import Optional
+import os
+import re
+from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,8 @@ def persist_flight_selection(row: dict) -> bool:
 FARE_DISCOUNTS_TABLE = "fare_discounts"
 CARD_OFFERS_TABLE = "card_offers"
 REFRESH_RUNS_TABLE = "offer_refresh_runs"
+HEALTH_EVENTS_TABLE = "system_health_events"
+PRICE_ALERTS_TABLE = "price_alerts"
 
 
 def upsert_fare_discounts(rows: list) -> int:
@@ -250,6 +253,110 @@ def load_latest_route_watch() -> list:
         return []
 
 
+CARD_POINT_RATES_TABLE = "card_point_rates"
+
+
+def upsert_card_point_rates(rows: list) -> int:
+    """One row per card: bank, name, points name, rupees per point. Null rate stays null."""
+    client = _get_client()
+    if client is None or not rows:
+        return 0
+    payload = []
+    seen = set()
+    for row in rows:
+        bank = (row.get("bank") or "Axis Bank").strip()
+        name = (row.get("card_name") or row.get("name") or "").strip()
+        if not name or (bank, name) in seen:
+            continue
+        seen.add((bank, name))
+        points = (row.get("points_name") or row.get("currency") or "").strip()
+        slug = (row.get("slug") or row.get("id") or "").strip()
+        if not slug:
+            slug = re.sub(r"[^a-z0-9]+", "-", f"{bank}-{name}".lower()).strip("-")[:64]
+        payload.append({
+            "slug": slug,
+            "bank": bank,
+            "card_name": name,
+            "points_name": points or None,
+            "inr_per_point": row.get("inr_per_point"),
+            "source_url": row.get("source_url") or row.get("url") or None,
+            "active": True,
+        })
+    if not payload:
+        return 0
+    try:
+        from datetime import datetime, timezone
+        stamp = datetime.now(timezone.utc).isoformat()
+        for row in payload:
+            row["fetched_at"] = stamp
+        client.table(CARD_POINT_RATES_TABLE).upsert(payload, on_conflict="bank,card_name").execute()
+        return len(payload)
+    except Exception as e:
+        logger.warning("Supabase upsert_card_point_rates failed: %s", e)
+        return 0
+
+
+def replace_card_point_rates(rows: list) -> int:
+    """Upsert the given cards and hide any previous row that is no longer in the set."""
+    saved = upsert_card_point_rates(rows)
+    if not saved:
+        return 0
+    keep = set()
+    for row in rows:
+        bank = (row.get("bank") or "Axis Bank").strip()
+        name = (row.get("card_name") or row.get("name") or "").strip()
+        if name:
+            keep.add((bank, name))
+    client = _get_client()
+    if client is None:
+        return saved
+    try:
+        existing = client.table(CARD_POINT_RATES_TABLE).select("id,bank,card_name").eq("active", True).execute()
+        drop = [row["id"] for row in existing.data or [] if (row.get("bank"), row.get("card_name")) not in keep]
+        if drop:
+            client.table(CARD_POINT_RATES_TABLE).update({"active": False}).in_("id", drop).execute()
+    except Exception as e:
+        logger.warning("Supabase replace_card_point_rates failed: %s", e)
+    return saved
+
+
+def load_card_point_rates() -> list:
+    client = _get_client()
+    if client is None:
+        return []
+    try:
+        res = (
+            client.table(CARD_POINT_RATES_TABLE)
+            .select("slug,bank,card_name,points_name,inr_per_point,source_url")
+            .eq("active", True)
+            .order("bank")
+            .execute()
+        )
+        return list(res.data or [])
+    except Exception as e:
+        logger.warning("Supabase load_card_point_rates failed: %s", e)
+        return []
+
+
+def load_credit_card_pages() -> list:
+    """Catalogue cards with the public page each one was read from."""
+    client = _get_client()
+    if client is None:
+        return []
+    try:
+        res = (
+            client.table(CREDIT_CARDS_TABLE)
+            .select("card_name,bank,listing_url,terms_url")
+            .eq("active", True)
+            .order("bank")
+            .execute()
+        )
+        return list(res.data or [])
+    except Exception as e:
+        logger.warning("Supabase load_credit_card_pages failed: %s", e)
+        return []
+
+
 def load_credit_cards() -> list:
     client = _get_client()
     if client is None:
@@ -308,3 +415,145 @@ def record_refresh_run(fare_rows: int, card_rows: int, ok: list, failed: list, n
         }).execute()
     except Exception as e:
         logger.warning("Supabase record_refresh_run failed: %s", e)
+
+
+def record_health_event(
+    component: str,
+    source: str,
+    status: str,
+    *,
+    http_status: Optional[int] = None,
+    message: str = "",
+    detail: Optional[dict] = None,
+    run_id: Optional[str] = None,
+) -> None:
+    """Log scraper / API health into system_health_events (ops UI reads this)."""
+    from datetime import datetime, timezone
+
+    row: dict[str, Any] = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "component": (component or "unknown")[:64],
+        "source": (source or "unknown")[:128],
+        "status": (status or "fail")[:32],
+        "http_status": http_status,
+        "message": (message or "")[:500] or None,
+        "detail": detail or {},
+        "run_id": run_id,
+    }
+    client = _get_client()
+    if client is None:
+        return
+    try:
+        client.table(HEALTH_EVENTS_TABLE).insert(row).execute()
+    except Exception as e:
+        logger.warning("Supabase record_health_event failed: %s", e)
+
+
+def load_health_events(
+    *,
+    limit: int = 100,
+    status: Optional[str] = None,
+    component: Optional[str] = None,
+    source: Optional[str] = None,
+) -> List[dict]:
+    """Recent health rows for the ops dashboard."""
+    client = _get_client()
+    if client is None:
+        return []
+    try:
+        q = (
+            client.table(HEALTH_EVENTS_TABLE)
+            .select("id,created_at,component,source,status,http_status,message,detail,run_id")
+            .order("created_at", desc=True)
+            .limit(max(1, min(limit, 500)))
+        )
+        if status:
+            q = q.eq("status", status)
+        if component:
+            q = q.eq("component", component)
+        if source:
+            q = q.eq("source", source)
+        return list((q.execute().data) or [])
+    except Exception as e:
+        logger.warning("Supabase load_health_events failed: %s", e)
+        return []
+
+
+def load_health_latest() -> List[dict]:
+    """Latest status per component+source (view, with table fallback)."""
+    client = _get_client()
+    if client is None:
+        return []
+    try:
+        res = (
+            client.table("system_health_latest")
+            .select("component,source,status,http_status,message,created_at,run_id")
+            .execute()
+        )
+        rows = list(res.data or [])
+        rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+        return rows
+    except Exception:
+        # View missing or RLS — collapse recent events in Python.
+        recent = load_health_events(limit=400)
+        latest: dict[tuple, dict] = {}
+        for row in recent:
+            key = (row.get("component"), row.get("source"))
+            if key not in latest:
+                latest[key] = row
+        return list(latest.values())
+
+
+def insert_price_alert(row: dict) -> Optional[dict]:
+    """Save a trip price alert. Returns the inserted row or None."""
+    client = _get_client()
+    if client is None:
+        return None
+    email = (row.get("email") or "").strip().lower()
+    origin = (row.get("origin") or "").strip().upper()[:3]
+    dest = (row.get("destination") or "").strip().upper()[:3]
+    try:
+        target = float(row.get("target_price") or 0)
+    except (TypeError, ValueError):
+        target = 0.0
+    if "@" not in email or len(origin) != 3 or len(dest) != 3 or target <= 0:
+        return None
+    payload = {
+        "email": email,
+        "origin": origin,
+        "destination": dest,
+        "depart_date": row.get("depart_date"),
+        "return_date": row.get("return_date") or None,
+        "cabin_class": (row.get("cabin_class") or "economy")[:32],
+        "target_price": target,
+        "currency": (row.get("currency") or "INR")[:8],
+        "baseline_price": row.get("baseline_price"),
+        "active": True,
+        "note": (row.get("note") or None),
+    }
+    try:
+        res = client.table(PRICE_ALERTS_TABLE).insert(payload).execute()
+        data = list(res.data or [])
+        return data[0] if data else payload
+    except Exception as e:
+        logger.warning("Supabase insert_price_alert failed: %s", e)
+        return None
+
+
+def load_active_price_alerts(limit: int = 200) -> List[dict]:
+    client = _get_client()
+    if client is None:
+        return []
+    try:
+        res = (
+            client.table(PRICE_ALERTS_TABLE)
+            .select("*")
+            .eq("active", True)
+            .order("created_at", desc=True)
+            .limit(max(1, min(limit, 500)))
+            .execute()
+        )
+        return list(res.data or [])
+    except Exception as e:
+        logger.warning("Supabase load_active_price_alerts failed: %s", e)
+        return []
